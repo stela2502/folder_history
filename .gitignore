@@ -1,0 +1,16 @@
+/target
+/test_output
+*.swp
+/.cargo/
+.ipynb_checkpoints/
+*.ipynb
+/work/
+/.nextflow*
+flamegraph.svg
+perf.data*
+.nf-test.log
+Log.out
+nelrune_test_out/
+bd_diagnostics.tsv
+*.orig
+clonomap_test
