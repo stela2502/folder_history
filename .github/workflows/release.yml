@@ -50,6 +50,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Verify scientific test fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f tests/data/scientific_mess/cluster.ipynb
+          test -f tests/data/scientific_mess/normalize.ipynb
+          test -f tests/data/nasty_programming_errors/notebooks/01_valid_multiline_read_write.ipynb
+          test -f tests/data/nasty_programming_errors/notebooks/nasty_programming_errors.ipynb
+          echo "Scientific notebook fixtures present"
       - name: Test
         if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo test --release --locked

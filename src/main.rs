@@ -1,6 +1,8 @@
 mod provenance;
 mod analysis_graph;
 mod report;
+mod spectator;
+mod gui;
 use anyhow::{Context, Result};
 use eframe::egui;
 use regex::Regex;
@@ -49,40 +51,63 @@ fn reveal_in_file_manager(root: &Path, relative: &str) -> io::Result<()> {
     { cmd.spawn().map(|_| ()) }
 }
 
-// Group physical FASTQ locations without confusing storage folders with experiments.
-// Never collapse unrelated directory branches to the archive root or a storage wrapper.
-fn fastq_source_folders(paths: &[&str]) -> Vec<(String, usize)> {
-    let mut dirs: BTreeMap<String, usize> = BTreeMap::new();
-    for path in paths {
-        if let Some((dir, _)) = path.rsplit_once('/') {
-            *dirs.entry(dir.to_owned()).or_default() += 1;
+// Open only indexed archive-relative files; never execute a directory or missing path.
+fn open_indexed_file(root: &Path, relative: &str) -> io::Result<()> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsafe archive-relative path"));
+    }
+    let absolute = root.join(candidate);
+    if !absolute.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("File does not exist: {}", absolute.display())));
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = Command::new("powershell.exe"); let escaped = absolute.to_string_lossy().replace("'", "''"); c.args(["-NoProfile", "-NonInteractive", "-Command", &format!("Invoke-Item -LiteralPath '{escaped}'")]); c };
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = Command::new("open"); c.arg(&absolute); c };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = { let mut c = Command::new("xdg-open"); c.arg(&absolute); c };
+    #[cfg(not(any(windows, unix)))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "No file opener for this OS"));
+    #[cfg(any(windows, unix))]
+    { cmd.spawn().map(|_| ()) }
+}
+
+// Candidate analysis membership is advisory. Never write these scores to the
+// provenance graph: directory similarity is not evidence of a processing edge.
+fn issue_analysis_candidates(
+    issue: &Issue,
+    assignment: &HashMap<String, String>,
+    artifacts: &[Artifact],
+    relations: &[Relation],
+) -> Vec<(String, u32, String)> {
+    let mut candidates: HashMap<String, (u32, Vec<&'static str>)> = HashMap::new();
+    let mut add = |path: &str, score: u32, reason: &'static str| {
+        if let Some(group) = assignment.get(path) {
+            let entry = candidates.entry(group.clone()).or_insert((0, Vec::new()));
+            if score > entry.0 { entry.0 = score; }
+            if !entry.1.contains(&reason) { entry.1.push(reason); }
+        }
+    };
+    // Source notebook/script is the strongest existing assignment evidence.
+    add(&issue.notebook, 100, "source script belongs to analysis");
+    // Explicitly recorded provenance links, not inferred directory links.
+    for edge in relations {
+        if edge.source == issue.notebook { add(&edge.target, 85, "recorded downstream link"); }
+        if edge.target == issue.notebook { add(&edge.source, 85, "recorded upstream link"); }
+    }
+    let target_name = Path::new(&issue.filename).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for artifact in artifacts {
+        if artifact.path == issue.filename {
+            add(&artifact.path, 95, "exact indexed path");
+        } else if !target_name.is_empty() && Path::new(&artifact.path).file_name().and_then(|n| n.to_str()) == Some(target_name) {
+            add(&artifact.path, 50, "matching basename (ambiguous)");
         }
     }
-    let mut branches: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
-    for (dir, count) in dirs {
-        let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
-        let first = parts.first().copied().unwrap_or("");
-        // Distinguish physical Server/Local/Desktop branches even when their
-        // logical sample names are identical.
-        let wrapper = matches!(first.to_ascii_lowercase().as_str(),
-            "server" | "local" | "shared" | "desktop" | "stefansdesktop" | "shamit" | "nas");
-        let depth = if wrapper { 2 } else { 1 };
-        let branch = parts.iter().take(depth).copied().collect::<Vec<_>>().join("/");
-        branches.entry(branch).or_default().push((dir, count));
-    }
-    let mut result = Vec::new();
-    for (branch, entries) in branches {
-        let total = entries.iter().map(|(_, n)| n).sum();
-        let mut common: Vec<&str> = entries[0].0.split('/').collect();
-        for (dir, _) in entries.iter().skip(1) {
-            let other: Vec<&str> = dir.split('/').collect();
-            common.truncate(common.iter().zip(other.iter()).take_while(|(a,b)| a == b).count());
-        }
-        let common_dir = common.join("/");
-        // A branch is already a meaningful, non-root boundary.
-        result.push((if common_dir.is_empty() { branch } else { common_dir }, total));
-    }
-    result
+    let mut ranked: Vec<_> = candidates.into_iter()
+        .map(|(group, (score, reasons))| (group, score, reasons.join("; "))).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
 }
 
 enum ScanEvent { Progress(String), Finished(Result<ScanResult, String>), Resolved(Result<(i64, i64), String>) }
@@ -99,87 +124,6 @@ struct App {
     nav_history: Vec<NavState>, nav_cursor: usize,
     recent_folders: Vec<PathBuf>, include_hidden: bool, scan_events: Option<Receiver<ScanEvent>>, scan_cancel: Option<Arc<AtomicBool>>,
 }
-// A display hierarchy, not a replacement for the recorded provenance graph.
-// Storage locations never participate in these labels.
-fn meaningful_segments(path: &str) -> Vec<&str> {
-    path.split('/').filter(|part| !part.is_empty() && !matches!(part.to_ascii_lowercase().as_str(),
-        "server" | "local" | "shared" | "desktop" | "stefansdesktop" | "shamit" | "nas")).collect()
-}
-fn experiment_label(path: &str, group_name: &str) -> String {
-    let parts = meaningful_segments(path);
-    if group_name.eq_ignore_ascii_case("spatial") {
-        if let Some(part) = parts.iter().find(|part| part.to_ascii_lowercase().starts_with("singlecell_")) {
-            return (*part).to_owned();
-        }
-    }
-    // Other large collection roots: retain an informative nested directory.
-    if let Some(pos) = parts.iter().position(|part| part.eq_ignore_ascii_case(group_name)) {
-        if matches!(group_name.to_ascii_lowercase().as_str(), "spatial" | "external" | "data") {
-            if let Some(part) = parts.get(pos+1) { return (*part).to_owned(); }
-        }
-    }
-    group_name.to_owned()
-}
-fn sample_label(path: &str, experiment: &str) -> String {
-    let parts = meaningful_segments(path);
-    if let Some(pos) = parts.iter().position(|part| part.eq_ignore_ascii_case(experiment)) {
-        if let Some(next) = parts.get(pos+1) {
-            if !matches!(next.to_ascii_lowercase().as_str(), "outs" | "analysis" | "results" | "raw" | "data" | "fastq" | "fastqs") {
-                return (*next).to_owned();
-            }
-        }
-    }
-    "Shared / unspecified sample".to_owned()
-}
-fn workflow_label(path: &str, kind: &str) -> &'static str {
-    let p = path.to_ascii_lowercase();
-    if p.ends_with(".fastq.gz") || p.ends_with(".fq.gz") || p.ends_with(".fastq") || p.ends_with(".fq") { "Raw sequencing libraries" }
-    else if p.ends_with(".cloupe") || p.contains("/loupe") { "Loupe / Cell Ranger visualization" }
-    else if p.contains("/clustering/") || p.contains("/diffexp/") || p.contains("/analysis/") { "Clustering and differential expression" }
-    else if p.contains("/filtered_feature_bc_matrix/") || p.contains("/raw_feature_bc_matrix/") || p.ends_with(".h5ad") || p.ends_with(".mtx.gz") { "Expression matrices" }
-    else if kind == "script" || kind == "notebook" { "Scripts and notebooks" }
-    else if p.ends_with(".png") || p.ends_with(".pdf") || p.ends_with(".svg") { "Figures" }
-    else if p.ends_with(".csv") || p.ends_with(".tsv") { "Tables" }
-    else { "Other files / pipeline metadata" }
-}
-fn fastq_library(path: &str) -> String {
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    let mut stem = filename.to_owned();
-    for ext in [".fastq.gz", ".fq.gz", ".fastq", ".fq"] {
-        if stem.to_ascii_lowercase().ends_with(ext) { stem.truncate(stem.len()-ext.len()); break; }
-    }
-    // Standard Illumina read/lane suffixes. Avoid merging unrelated samples.
-    let re = regex::Regex::new(r"(?i)(?:_S[0-9]+)?(?:_L[0-9]{3})?(?:_R[12]|_[12])(?:_[0-9]{3})?$").unwrap();
-    re.replace(&stem, "").to_string()
-}
-fn provenance_step(path: &str, relations: &[Relation]) -> String {
-    // A script is the unit of execution when the database actually records it.
-    let mut scripts: Vec<&str> = relations.iter().filter(|r| r.source == path || r.target == path)
-        .filter_map(|r| {
-            let other = if r.source == path { r.target.as_str() } else { r.source.as_str() };
-            let o = other.to_ascii_lowercase();
-            if [".py", ".r", ".sh", ".ipynb", ".nf"].iter().any(|e| o.ends_with(e)) { Some(other) } else { None }
-        }).collect();
-    scripts.sort_unstable();
-    scripts.dedup();
-    if let Some(script) = scripts.first() { return format!("Input → {} → output", script.rsplit('/').next().unwrap_or(script)); }
-    let lower = path.to_ascii_lowercase();
-    if [".fastq", ".fq", ".fastq.gz", ".fq.gz"].iter().any(|e| lower.ends_with(e)) {
-        return format!("FASTQ library: {}", fastq_library(path));
-    }
-    if lower.ends_with(".cloupe") { return "Cell Ranger → .cloupe".into(); }
-    if let Some(pos) = lower.find("/clustering/") {
-        let remainder = &path[pos+"/clustering/".len()..];
-        return format!("Clustering → {}", remainder.split('/').next().unwrap_or("outputs"));
-    }
-    if let Some(pos) = lower.find("/diffexp/") {
-        let remainder = &path[pos+"/diffexp/".len()..];
-        return format!("Differential expression → {}", remainder.split('/').next().unwrap_or("outputs"));
-    }
-    // Unknown producer: keep files together as an *unresolved* operation, not a fabricated link.
-    "Unresolved / no recorded producer".into()
-}
-
 impl Default for App {
     fn default() -> Self {
         Self { root: None, db: None, writable: false, index_path: None, tab: Tab::Search,
@@ -1130,40 +1074,6 @@ fn source_group(path: &str) -> String {
     normalized.split_once('/').map(|(first, _)| first).unwrap_or("(archive root)").to_owned()
 }
 
-fn file_role(path: &str, kind: &str, relations: &[Relation]) -> (egui::Color32, &'static str) {
-    let lower = path.to_ascii_lowercase();
-    let suffix = lower.rsplit('.').next().unwrap_or("");
-    let is_script = matches!(suffix, "py" | "r" | "sh" | "ipynb" | "rs" | "nf");
-    if is_script {
-        let writes_dataset = relations.iter().any(|r| {
-            (r.source == path || r.target == path) && {
-                let other = if r.source == path { &r.target } else { &r.source };
-                let o = other.to_ascii_lowercase();
-                [".h5ad", ".h5", ".mtx", ".mtx.gz", ".bam", ".cram", ".parquet"]
-                    .iter().any(|ext| o.ends_with(ext))
-            }
-        });
-        return if writes_dataset { (egui::Color32::from_rgb(180, 125, 240), "processing script") }
-            else { (egui::Color32::from_rgb(245, 105, 105), "analysis script") };
-    }
-    if [".fastq", ".fastq.gz", ".fq", ".fq.gz", ".bcl", ".bcl.gz"]
-        .iter().any(|ext| lower.ends_with(ext)) {
-        (egui::Color32::from_rgb(100, 175, 255), "raw data")
-    } else if [".png", ".svg", ".jpg", ".jpeg", ".pdf", ".tiff"]
-        .iter().any(|ext| lower.ends_with(ext)) {
-        (egui::Color32::from_rgb(105, 215, 145), "figure / document")
-    } else if [".h5ad", ".h5", ".mtx", ".mtx.gz", ".bam", ".cram"]
-        .iter().any(|ext| lower.ends_with(ext)) {
-        (egui::Color32::from_rgb(80, 145, 215), "processed data (verify)")
-    } else if [".tsv", ".csv", ".xlsx", ".json"]
-        .iter().any(|ext| lower.ends_with(ext)) {
-        (egui::Color32::from_rgb(235, 205, 90), "table / metadata")
-    } else if [".fa", ".fasta", ".gtf", ".gff", ".fai", ".mmi"]
-        .iter().any(|ext| lower.ends_with(ext)) {
-        (egui::Color32::GRAY, "reference")
-    } else { (egui::Color32::LIGHT_GRAY, if kind.is_empty() { "file" } else { "other" }) }
-}
-
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan();
@@ -1271,108 +1181,7 @@ impl eframe::App for App {
                 return;
             }
             match self.tab {
-                Tab::Spectator => {
-                    ui.heading("Scientific analyses · Spectator");
-                    ui.label("Experiment → sample/run → workflow → input/operation/output step → files. Storage locations are ignored.");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::from_rgb(100,175,255), "● raw");
-                        ui.colored_label(egui::Color32::from_rgb(180,125,240), "● processing");
-                        ui.colored_label(egui::Color32::from_rgb(80,145,215), "● dataset");
-                        ui.colored_label(egui::Color32::from_rgb(245,105,105), "● analysis");
-                        ui.colored_label(egui::Color32::from_rgb(235,205,90), "● tables");
-                        ui.colored_label(egui::Color32::from_rgb(105,215,145), "● figures");
-                        ui.colored_label(egui::Color32::GRAY, "● references");
-                    });
-                    ui.separator();
-                    ui.label(format!("{} detected groups · {} indexed files", self.analysis_groups.len(), self.artifacts.len()));
-                    let by_path: HashMap<&str, &Artifact> = self.artifacts.iter().map(|a| (a.path.as_str(), a)).collect();
-                    let links = &self.relations;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for group in &self.analysis_groups {
-                            let title = self.group_names.get(&group.key).map(String::as_str).unwrap_or(&group.suggested_name);
-                            let issues = self.issues.iter().filter(|i| self.analysis_assignment.get(&i.notebook)==Some(&group.key) && i.decision=="open").count();
-                            let header = format!("{title} · {} files · {issues} open issues · {} links", group.paths.len(), group.edge_count);
-                            ui.collapsing(header, |ui| {
-                                ui.small(format!("Analysis group: {} · source hint: {}", group.key, group.source_hint));
-                                let mut experiments: BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<&str>>>>> = BTreeMap::new();
-                                for path in &group.paths {
-                                    let Some(a) = by_path.get(path.as_str()) else { continue; };
-                                    let experiment = experiment_label(path, &group.suggested_name);
-                                    let sample = sample_label(path, &experiment);
-                                    let workflow = workflow_label(path, &a.kind).to_owned();
-                                    let step = provenance_step(path, links);
-                                    experiments.entry(experiment).or_default().entry(sample).or_default()
-                                        .entry(workflow).or_default().entry(step).or_default().push(path);
-                                }
-                                for (experiment, samples) in experiments {
-                                    let experiment_count: usize = samples.values().flat_map(|w| w.values()).flat_map(|s| s.values()).map(Vec::len).sum();
-                                    ui.collapsing(format!("🧬 {experiment} · {experiment_count} files"), |ui| {
-                                        for (sample, workflows) in samples {
-                                            let sample_count: usize = workflows.values().flat_map(|s| s.values()).map(Vec::len).sum();
-                                            ui.collapsing(format!("Sample / run: {sample} · {sample_count} files"), |ui| {
-                                                for (workflow, steps) in workflows {
-                                                    let workflow_count: usize = steps.values().map(Vec::len).sum();
-                                                    ui.collapsing(format!("{workflow} · {workflow_count} files"), |ui| {
-                                                        for (step, paths) in steps {
-                                                            ui.collapsing(format!("{step} · {} files", paths.len()), |ui| {
-                                                                if step.starts_with("FASTQ library:") {
-                                                                    let sources = fastq_source_folders(&paths);
-                                                                    ui.label(format!("{} FASTQ files · {} physical folder cluster(s)", paths.len(), sources.len()));
-                                                                    for (dir, count) in &sources {
-                                                                        ui.horizontal_wrapped(|ui| {
-                                                                            ui.label(format!("📁 {dir} · {count} files"));
-                                                                            if ui.small_button("Open in file explorer").clicked() {
-                                                                                if let Some(root) = &self.root {
-                                                                                    if let Err(e) = reveal_in_file_manager(root, dir) {
-                                                                                        self.status = format!("Cannot open file manager: {e}");
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        });
-                                                                    }
-                                                                    ui.collapsing(format!("📋 Show FASTQ file list ({} files)", paths.len()), |ui| {
-                                                                        for path in &paths {
-                                                                            let filename = path.rsplit('/').next().unwrap_or(path);
-                                                                            ui.label(format!("{filename} — {path}")).on_hover_text(*path);
-                                                                        }
-                                                                    });
-                                                                    ui.separator();
-                                                                }
-                                                                for path in paths {
-                                                                    let Some(a) = by_path.get(path) else { continue; };
-                                                                    let (color, role) = file_role(&a.path, &a.kind, links);
-                                                                    let basename = a.path.rsplit('/').next().unwrap_or(&a.path);
-                                                                    if ui.selectable_label(self.selected==Some(a.id), egui::RichText::new(format!("● {basename}")).color(color))
-                                                                        .on_hover_text(format!("{}\n{role}", a.path)).clicked() { self.selected=Some(a.id); }
-                                                                    if self.selected==Some(a.id) {
-                                                                        ui.small(&a.path);
-                                                                        if ui.small_button("📂 Open containing folder").clicked() {
-                                                                            if let Some(root) = &self.root {
-                                                                                if let Err(e) = reveal_in_file_manager(root, &a.path) {
-                                                                                    self.status = format!("Cannot open file manager: {e}");
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        for r in links.iter().filter(|r| r.source==a.path || r.target==a.path).take(30) {
-                                                                            let direction = if r.source==a.path { "→" } else { "←" };
-                                                                            let other = if r.source==a.path { &r.target } else { &r.source };
-                                                                            ui.small(format!("{direction} {} · {other}", r.kind));
-                                                                        }
-                                                                        if ui.small_button("Explore relationships").clicked() { self.tab=Tab::Graph; }
-                                                                    }
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                                }
-                                            });
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    });
-                }
+                Tab::Spectator => self.show_spectator(ui),
                 Tab::Search => {
                     ui.heading("Find research data");
                     ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search filename, sample, notebook, FASTQ, figure..."));
@@ -1384,8 +1193,34 @@ impl eframe::App for App {
                         .take(500).map(|a| (a.id,a.path.clone(),a.kind.clone())).collect();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (id,path,kind) in matches {
-                            if ui.selectable_label(self.selected==Some(id), format!("[{kind}] {path}")).clicked() {
-                                self.selected=Some(id); self.tab=Tab::Graph;
+                            let response = ui.selectable_label(self.selected==Some(id), format!("[{kind}] {path}"))
+                                .on_hover_text("Double-click to open; right-click for file actions");
+                            response.context_menu(|ui| {
+                                if ui.button("Open file").clicked() {
+                                    if let Some(root) = &self.root { if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); } }
+                                    ui.close();
+                                }
+                                if ui.button("Open containing folder").clicked() {
+                                    if let Some(root) = &self.root { if let Err(e) = reveal_in_file_manager(root, &path) { self.status = format!("Cannot open file manager: {e}"); } }
+                                    ui.close();
+                                }
+                                if ui.button("Copy path").clicked() {
+                                    if let Some(root) = &self.root { ui.ctx().copy_text(root.join(&path).display().to_string()); }
+                                    ui.close();
+                                }
+                            });
+                            if response.double_clicked() {
+                                if let Some(root) = &self.root { if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); } }
+                            } else if response.clicked() { self.selected=Some(id); }
+                            if self.selected == Some(id) {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Open file with default application").clicked() {
+                                        if let Some(root) = &self.root {
+                                            if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); }
+                                        }
+                                    }
+                                    if ui.small_button("Relationships").clicked() { self.tab = Tab::Graph; }
+                                });
                             }
                         }
                     });
@@ -1394,6 +1229,11 @@ impl eframe::App for App {
                     ui.heading("File history");
                     if let Some(path) = self.selected_path() {
                         ui.label(format!("Selected: {path}"));
+                        if ui.button("Open file").clicked() {
+                            if let Some(root) = &self.root {
+                                if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); }
+                            }
+                        }
                         if ui.button("📂 Open containing folder").clicked() {
                             if let Some(root) = &self.root {
                                 if let Err(e) = reveal_in_file_manager(root, &path) {
@@ -1457,7 +1297,28 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    ui.small("Grouping uses weighted provenance edges, not top-level folders. Weak or disconnected files remain visible.");
+                    ui.small("Issues are organized by their source script's analysis. Candidate assignments below are suggestions, not new provenance edges.");
+                    let unassigned: Vec<&Issue> = self.issues.iter().filter(|i| i.decision == "open" && !self.analysis_assignment.contains_key(&i.notebook)).collect();
+                    ui.collapsing(format!("Unassigned to an analysis · {} issue occurrences", unassigned.len()), |ui| {
+                        let mut by_dependency = BTreeMap::<(String, String), &Issue>::new();
+                        for issue in &unassigned { by_dependency.entry((issue.category.clone(), issue.filename.clone())).or_insert(issue); }
+                        ui.label("Suggestions are ranked from recorded provenance and indexed filename matches. Nothing is assigned automatically.");
+                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                            for ((category, filename), issue) in by_dependency {
+                                let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.link(format!("{filename} · {category}")).clicked() {
+                                        self.active_dependency = Some((category.clone(), filename.clone()));
+                                    }
+                                    if let Some((group, score, reason)) = ranked.first() {
+                                        let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
+                                        ui.label(format!("→ {name} ({score}/100; {reason})"));
+                                        if ui.small_button("View analysis issues").clicked() { self.group_filter = group.clone(); }
+                                    } else { ui.weak("No supported analysis candidate"); }
+                                });
+                            }
+                        });
+                    });
                     if !self.scan_summary.is_empty() { ui.label(&self.scan_summary); }
                     ui.horizontal(|ui| {
                         if ui.button("Copy Summary").clicked() {
@@ -1519,6 +1380,17 @@ impl eframe::App for App {
                         if ui.button("← Back to evidence").clicked() { self.active_dependency = None; }
                         ui.heading(&filename);
                         ui.label(format!("Category: {category}"));
+                        if let Some(issue) = self.issues.iter().find(|i| i.category == category && i.filename == filename) {
+                            let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
+                            if !ranked.is_empty() {
+                                ui.collapsing("Candidate analyses (advisory)", |ui| {
+                                    for (group, score, reason) in ranked.iter().take(5) {
+                                        let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
+                                        ui.label(format!("{name} · {score}/100 · {reason}"));
+                                    }
+                                });
+                            }
+                        }
                         let occurrences: Vec<Issue> = self.issues.iter()
                             .filter(|i| i.category == category && i.filename == filename).cloned().collect();
                         ui.label(format!("{} occurrences", occurrences.len()));
@@ -1552,7 +1424,15 @@ impl eframe::App for App {
                         let root = self.root.clone();
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for issue in &occurrences {
-                                ui.collapsing(format!("{} · cell/line {} · {}", issue.notebook, issue.cell, issue.decision), |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Open source").on_hover_text(&issue.notebook).clicked() {
+                                        if let Some(root) = &root {
+                                            if let Err(e) = open_indexed_file(root, &issue.notebook) {
+                                                self.status = format!("Cannot open source: {e}");
+                                            }
+                                        }
+                                    }
+                                    ui.collapsing(format!("{} · cell/line {} · {}", issue.notebook, issue.cell, issue.decision), |ui| {
                                     if let Some(root) = &root {
                                         let path = root.join(&issue.notebook);
                                         if path.extension().is_some_and(|ext| ext == "ipynb") {
@@ -1584,6 +1464,7 @@ impl eframe::App for App {
                                             }
                                         }
                                     }
+                                    });
                                 });
                             }
                         });

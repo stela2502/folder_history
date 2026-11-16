@@ -3,7 +3,11 @@
 *.swp
 /.cargo/
 .ipynb_checkpoints/
+# Keep notebook checkpoint fixtures when tests depend on them.
+!tests/data/**/.ipynb_checkpoints/
 *.ipynb
+# Scientific regression fixtures must be version-controlled.
+!tests/data/**/*.ipynb
 /work/
 /.nextflow*
 flamegraph.svg

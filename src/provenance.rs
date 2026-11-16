@@ -1,6 +1,120 @@
 //! Conservative, language-light provenance candidate extraction.
 //! No script execution or dependency on imported helper implementations.
 use super::*;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct RuleSet { version: u32, functions: Vec<FunctionRule> }
+#[derive(Debug, Deserialize)]
+struct FunctionRule {
+    name: String,
+    language: String,
+    directory_arg: Option<usize>,
+    output_arg: Option<usize>,
+    default_output: Option<String>,
+    #[serde(default)] files: Vec<String>,
+    #[serde(default)] patterns: Vec<String>,
+    #[serde(default)] source: String,
+}
+
+fn load_rules(root: &Path) -> Result<Vec<FunctionRule>> {
+    let mut builtins: RuleSet = serde_yaml::from_str(include_str!("../rules/scientific_functions.yaml"))?;
+    if builtins.version != 1 { anyhow::bail!("Unsupported built-in rule version"); }
+    let custom = root.join(".folder_history/provenance_rules.yaml");
+    if custom.is_file() {
+        let extra: RuleSet = serde_yaml::from_str(&std::fs::read_to_string(&custom)?)?;
+        if extra.version != 1 { anyhow::bail!("Unsupported provenance rules version in {}", custom.display()); }
+        // Project-local rules override bundled rules by function name and language.
+        for rule in extra.functions {
+            builtins.functions.retain(|r| !(r.name == rule.name && r.language == rule.language));
+            builtins.functions.push(rule);
+        }
+    }
+    for rule in &builtins.functions {
+        if rule.name.is_empty() || !matches!(rule.language.as_str(), "r" | "python")
+            || rule.directory_arg == Some(0) || rule.output_arg == Some(0)
+            || (rule.directory_arg.is_none() && rule.output_arg.is_none()) {
+            anyhow::bail!("Invalid provenance function rule: {}", rule.name);
+        }
+    }
+    Ok(builtins.functions)
+}
+
+fn rule_output(db: &Connection, rel: &str, line: usize, candidate: &str, rule: &FunctionRule,
+               paths: &HashSet<String>) -> Result<usize> {
+    let (resolved, external, ambiguous) = resolve_reference(candidate, rel, paths);
+    if external {
+        record_issue(db, rel, line, &reference_name(candidate), "external")?;
+        return Ok(0);
+    }
+    if ambiguous {
+        record_issue(db, rel, line, &reference_name(candidate), "ambiguous")?;
+        return Ok(0);
+    }
+    if let Some(target) = resolved {
+        let evidence = format!("{}: cell/line {}: function rule {} ({})", rel, line, rule.name, rule.source);
+        let is_directory = paths.iter().any(|p| p.starts_with(&format!("{target}/")));
+        add_relation(db, rel, &target, if is_directory {"writes_directory"} else {"writes"}, &evidence, false)?;
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+fn apply_rule(db: &Connection, rel: &str, line: usize, args: &str, rule: &FunctionRule,
+              vars: &HashMap<String,String>, paths: &HashSet<String>) -> Result<usize> {
+    let arguments = split_args(args);
+    let arg_value = |n: usize, names: &[&str]| -> Option<String> {
+        if n == 0 { return None; }
+        // Named arguments may appear in any position, including R's path='data'.
+        for arg in &arguments {
+            if let Some((key, expr)) = arg.split_once('=') {
+                if names.contains(&key.trim()) { return value(expr, vars); }
+            }
+        }
+        // Positional arguments exclude named arguments.
+        arguments.iter().filter(|a| !a.contains('=')).nth(n-1).and_then(|a| value(a, vars))
+    };
+    let mut count = 0;
+    if let Some(n) = rule.output_arg {
+        if let Some(target) = arg_value(n, &["output_file", "out_csv", "ofile", "file", "filename"]).or_else(|| {
+            if arguments.len() < n { rule.default_output.clone() } else { None }
+        }) {
+            count += rule_output(db, rel, line, &target, rule, paths)?;
+        }
+    }
+    if let Some(n) = rule.directory_arg {
+        if let Some(dir) = arg_value(n, &["path", "output_dir", "outpath", "directory"]) {
+            // The directory itself is a useful edge even if no child matches.
+            count += rule_output(db, rel, line, &dir, rule, paths)?;
+            let (resolved, external, ambiguous) = resolve_reference(&dir, rel, paths);
+            if !external && !ambiguous {
+                if let Some(base) = resolved {
+                    for filename in &rule.files {
+                        count += rule_output(db, rel, line, &format!("{base}/{filename}"), rule, paths)?;
+                    }
+                    for pattern in &rule.patterns {
+                        if let Some(suffix) = pattern.strip_prefix('*') {
+                            let prefix = format!("{base}/");
+                            for path in paths {
+                                if let Some(rest) = path.strip_prefix(&prefix) {
+                                    if !rest.contains('/') && rest.ends_with(suffix) {
+                                        count += rule_output(db, rel, line, path, rule, paths)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for filename in &rule.files {
+            count += rule_output(db, rel, line, filename, rule, paths)?;
+        }
+    }
+    Ok(count)
+}
+
 
 fn direction(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
@@ -80,7 +194,7 @@ fn file_operation(label: &str) -> bool {
     direction(&lower)!="references" || lower.ends_with("to_csv") || lower.ends_with("to_parquet")
 }
 fn is_identifier(c:char)->bool {c.is_ascii_alphanumeric() || c=='_' || c=='.'}
-fn operations(source:&str)->Vec<(usize,String,usize)> {
+fn operations(source:&str, rules:&[FunctionRule])->Vec<(usize,String,usize)> {
     let bytes=source.as_bytes(); let mut found=Vec::new();
     let mut i=0; let mut quote:Option<u8>=None; let mut escaped=false; let mut comment=false;
     while i<bytes.len() {
@@ -98,7 +212,7 @@ fn operations(source:&str)->Vec<(usize,String,usize)> {
             while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i]==b'_' || bytes[i]==b'.') {i+=1;}
             let label=&source[start..i];
             let mut open=i;while open<bytes.len() && bytes[open].is_ascii_whitespace(){open+=1;}
-            if open<bytes.len() && bytes[open]==b'(' && file_operation(label) {
+            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.name == label.rsplit('.').next().unwrap_or(label))) {
                 let line=source[..start].bytes().filter(|b|*b==b'\n').count()+1;
                 found.push((line,label.to_owned(),open+1));
             }
@@ -164,10 +278,10 @@ fn filename_args(label:&str, s:&str, vars:&HashMap<String,String>)->Vec<(String,
     }
     found
 }
-fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>)->Result<usize> {
+fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule])->Result<usize> {
     let assign=Regex::new(r#"^\s*(?:export\s+)?([A-Za-z_][\w.]*)\s*(?:<-|=)\s*(.*?)\s*$"#)?;
     let mut count=0;
-    let ops=operations(source);
+    let ops=operations(source,rules);
     // Assignments are tracked in source order, but unresolved assignments
     // invalidate earlier values rather than retaining stale provenance.
     let mut assignments:Vec<(usize,String,String)>=Vec::new();
@@ -195,6 +309,13 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
         });
         let limit=if !balanced {next.map_or(end,|n|end.min(n))}else{end};
         let args=&remaining[..limit.min(remaining.len())];
+        if balanced {
+            let name=label.rsplit('.').next().unwrap_or(label);
+            let language=if rel.to_ascii_lowercase().ends_with(".r") {"r"} else {"python"};
+            for rule in rules.iter().filter(|r|r.name==name && (r.language==language || rel.ends_with(".ipynb"))) {
+                count+=apply_rule(db,rel,line_base+line-1,args,rule,vars,paths)?;
+            }
+        }
         let mut candidates=filename_args(label,args,vars);
         // A malformed call may have a complete filename literal followed by
         // another argument without a comma. Preserve that literal as evidence
@@ -243,7 +364,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     }
     Ok(count)
 }
-fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool)->Result<usize> {
+fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule])->Result<usize> {
     let mut vars=HashMap::new();let mut count=0;
     if shell {
         for (line,raw) in lines {
@@ -257,10 +378,11 @@ fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<
     }
     let mut source=String::new();
     for (_,line) in lines {source.push_str(line);source.push('\n');}
-    count+=analyze_source(db,rel,&source,1,paths,&mut vars)?;
+    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules)?;
     Ok(count)
 }
 pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->Result<usize>{
+    let rules=load_rules(root)?;
     let content=std::fs::read_to_string(root.join(rel))?;
     if rel.ends_with(".ipynb") {
         let notebook:serde_json::Value=serde_json::from_str(&content)?;
@@ -269,19 +391,20 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
             for (idx,cell) in cells.iter().enumerate() {
                 if cell["cell_type"]!="code" {continue;}
                 let src=if let Some(a)=cell["source"].as_array(){a.iter().filter_map(|v|v.as_str()).collect::<String>()}else{cell["source"].as_str().unwrap_or("").to_string()};
-                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars)?;
+                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules)?;
             }
         }
         Ok(count)
     } else {
         let shell=rel.ends_with(".sh")||rel.ends_with(".bash");
         let lines:Vec<(usize,String)>=content.lines().enumerate().map(|(i,s)|(i+1,s.to_owned())).collect();
-        analyze_lines(db,rel,&lines,paths,shell)
+        analyze_lines(db,rel,&lines,paths,shell,&rules)
     }
 }
 
 #[cfg(test)] mod tests {
  use super::*;
+
  // Regression: malformed source code must never crash the provenance scanner.
  // This test is intentionally RED against the overnight-run implementation.
  #[test] fn malformed_fstrings_do_not_panic() {
@@ -314,6 +437,7 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
 #[cfg(test)]
 mod nasty_programming_errors_tests {
     use super::*;
+
 
     #[test]
     fn multiline_cells_and_broken_cells_use_existing_files_as_evidence() -> Result<()> {
@@ -357,6 +481,7 @@ mod nasty_programming_errors_tests {
 #[cfg(test)]
 mod bioinformatics_nasty_provenance_tests {
     use super::*;
+
 
     fn fixture_root() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -459,4 +584,27 @@ mod bioinformatics_nasty_provenance_tests {
         assert!(count >= 2, "scan should retain valid notebook links despite malformed neighbors");
         Ok(())
     }
+    #[test]
+    fn scientific_function_rules_link_implicit_outputs() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        schema(&db)?;
+        let rules = load_rules(Path::new("/nonexistent-folderhistory-rule-test"))?;
+        let paths: HashSet<String> = [
+            "analysis/export.R", "analysis/vr", "analysis/vr/cellexalObj.RData",
+            "analysis/vr/database.sqlite", "analysis/vr/umap.mds",
+            "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
+        ].into_iter().map(str::to_owned).collect();
+        let mut vars = HashMap::new();
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules)?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules)?;
+        let targets = db.prepare("SELECT target FROM relations")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        assert!(targets.contains("analysis/vr/cellexalObj.RData"));
+        assert!(targets.contains("analysis/vr/database.sqlite"));
+        assert!(targets.contains("analysis/vr/umap.mds"));
+        assert!(targets.contains("analysis/stats/leiden_cluster_0.csv"));
+        Ok(())
+    }
+
 }

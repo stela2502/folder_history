@@ -1,0 +1,45 @@
+# Source-verified function contracts. Inference is conditional on indexed outputs.
+# An output is not proof that a historical function call actually executed.
+version: 1
+functions:
+  - name: export2cellexalvr
+    language: r
+    directory_arg: 2
+    files: [cellexalObj.RData, a.meta.cell, index.facs, c.meta.gene, database.sqlite]
+    patterns: ['*.mds']
+    source: sonejilab/cellexalvrR R/ExportFunctions.R
+  - name: write_as_sqlite3
+    language: r
+    output_arg: 2
+    source: sonejilab/cellexalvrR R/ExportFunctions.R
+  - name: write_stats_tables
+    language: python
+    directory_arg: 2
+    patterns: ['*.csv']
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+  - name: write_pseudobulk_stats_tables
+    language: python
+    directory_arg: 2
+    patterns: ['*.csv']
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+  - name: write_data_to_directory
+    language: python
+    directory_arg: 2
+    files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+  - name: impute_expression_data
+    language: python
+    directory_arg: 2
+    files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+  - name: write_top_genes_per_cluster
+    language: python
+    output_arg: 4
+    default_output: top_genes_per_cluster.csv
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+  - name: predict_celltype
+    language: python
+    output_arg: 4
+    default_output: cluster_marker_summary.csv
+    files: [cluster_label_proposals.csv]
+    source: stela2502/ScanpyAutoAnalyzer functions.py
