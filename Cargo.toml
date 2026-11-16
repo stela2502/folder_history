@@ -1,6 +1,6 @@
 [package]
 name = "folder-history"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Stefan Lang"]
 description = "Offline research folder history, search, and provenance explorer"
