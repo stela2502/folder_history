@@ -589,31 +589,112 @@ pub fn report_safe(value: &str) -> String {
 }
 
 
+// A database may exist after an interrupted scan. Only this marker certifies
+// that the batch scan returned successfully. It is not a database lock file.
+pub fn batch_finished_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("sqlite.finished")
+}
+
+// Keep SQLite transactions off SMB/CIFS shares. The archive only receives a
+// closed, verified database snapshot; each worker owns a separate local folder.
+struct BatchWorkspace(PathBuf);
+impl BatchWorkspace {
+    fn new() -> Result<Self> {
+        let base = std::env::var_os("TMPDIR").map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        for attempt in 0..1000u32 {
+            let path = base.join(format!("folder-history-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos(),
+                attempt));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("Unable to create a unique local scanning directory")
+    }
+}
+impl Drop for BatchWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub fn batch_scan_folder(root: &Path, rescan: bool) -> Result<String> {
     if !root.is_dir() { anyhow::bail!("Not a directory: {}", root.display()); }
     let root = root.canonicalize()?;
     let db_path = local_index_path(&root);
-    if db_path.is_file() && !rescan {
-        return Ok(format!("SKIP existing project index: {}", db_path.display()));
-    }
-    import_existing_index(&root, &db_path)?;
-    if db_path.is_file() && !rescan {
-        return Ok(format!("SKIP imported project index: {}", db_path.display()));
+    let finished = batch_finished_path(&db_path);
+    if db_path.is_file() && finished.is_file() && !rescan {
+        return Ok(format!("SKIP completed project index: {}", db_path.display()));
     }
     if let Some(parent) = db_path.parent() { std::fs::create_dir_all(parent)?; }
-    let mut db = Connection::open(&db_path)
-        .with_context(|| format!("Opening {}", db_path.display()))?;
+
+    let workspace = BatchWorkspace::new()?;
+    let local_db = workspace.0.join("history.sqlite");
+    if db_path.is_file() {
+        // A raw copy is only safe for a quiescent, rollback-journal database.
+        // Refuse to ignore pending journal/WAL data.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+            if sidecar.exists() {
+                anyhow::bail!("Cannot safely copy SQLite database with sidecar {}. Close other SQLite clients first.", sidecar.display());
+            }
+        }
+        std::fs::copy(&db_path, &local_db)
+            .with_context(|| format!("Copying {} into local workspace", db_path.display()))?;
+    } else {
+        // Legacy migration must also execute locally, never on the SMB share.
+        import_existing_index(&root, &local_db)?;
+    }
+
+    let mut db = Connection::open(&local_db)
+        .with_context(|| format!("Opening local SQLite {}", local_db.display()))?;
+    db.busy_timeout(std::time::Duration::from_secs(30))?;
+    // Do not produce WAL sidecars for the published archive.
+    db.execute_batch("PRAGMA journal_mode=DELETE;")?;
     schema(&db)?;
     let cancel = AtomicBool::new(false);
     let started = std::time::Instant::now();
     let result = scan(&mut db, &root, false, &cancel, |message| {
         eprintln!("    {message}");
     })?;
+    let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" { anyhow::bail!("Local SQLite integrity check failed: {integrity}"); }
+    db.close().map_err(|(_, error)| error)?;
+
+    // Copy into the destination directory first. The existing archive database
+    // remains intact if the scan or transfer fails.
+    let staging = db_path.with_extension(format!("sqlite.publish-{}", std::process::id()));
+    if staging.exists() {
+        anyhow::bail!("Publication staging file already exists: {}", staging.display());
+    }
+    let publication = (|| -> Result<()> {
+        std::fs::copy(&local_db, &staging)
+            .with_context(|| format!("Publishing local SQLite to {}", staging.display()))?;
+        // Never leave a valid completion marker pointing at an in-progress
+        // replacement. A failed publication remains eligible for rescan.
+        if finished.exists() { std::fs::remove_file(&finished)?; }
+        std::fs::rename(&staging, &db_path)
+            .with_context(|| format!("Replacing archive SQLite {}", db_path.display()))?;
+        let marker = format!("schema_version=1\ncompleted_unix={}\nfiles={}\nsteps={}\nlinks={}\n",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+            result.files, result.steps, result.links);
+        let temporary = finished.with_extension(format!("sqlite.finished.tmp-{}", std::process::id()));
+        std::fs::write(&temporary, marker)?;
+        let marker_result = std::fs::rename(&temporary, &finished);
+        if marker_result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        marker_result?;
+        Ok(())
+    })();
+    if publication.is_err() { let _ = std::fs::remove_file(&staging); }
+    publication?;
     Ok(format!("OK files={} scripts={} parsed={} links={} warnings={} elapsed={:.1}s index={}",
         result.files, result.scripts, result.parsed, result.links,
         result.warnings, started.elapsed().as_secs_f64(), db_path.display()))
 }
-
 
 #[cfg(test)]
 mod tests {
