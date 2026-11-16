@@ -6,7 +6,7 @@ PYTHON ?= python3
 CARGO ?= cargo
 
 help:
-	@printf '%s\n' 'make test        Run release-mode tests' 'make build       Build release-mode binaries' 'make bump-patch Increment patch version and update Cargo.lock' 'make bump-minor Increment minor version' 'make bump-major Increment major version' 'make release     Commit version, create tag, push commit and tag' 'make status      Show package version and git status'
+	@printf '%s\n' 'make test        Run release-mode tests' 'make build       Build release-mode binaries' 'make bump-patch Increment patch version and update Cargo.lock' 'make bump-minor Increment minor version' 'make bump-major Increment major version' 'make release     Commit version, create tag, push commit and tag' 'make status      Diagnose release state and next action'
 
 test:
 	$(CARGO) test -r --locked
@@ -24,10 +24,9 @@ bump-major:
 	$(PYTHON) scripts/bump_version.py major
 
 status:
-	@$(PYTHON) scripts/bump_version.py show
-	@git status --short
+	@$(PYTHON) scripts/bump_version.py status
 
-# Run after bump-*; never create a tag for a dirty tree or detached HEAD.
-# The tag is pushed only after the branch commit has been pushed successfully.
+# State-aware: accepts a pending bump or an already committed version.
+# Tests before tagging and atomically pushes branch and tag.
 release:
 	@$(PYTHON) scripts/bump_version.py release

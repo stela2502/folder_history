@@ -1,111 +1,177 @@
 #!/usr/bin/env python3
-"""Bump FolderHistory's Cargo version and publish a matching git tag."""
+"""State-aware Cargo version bumping and GitHub tag publishing."""
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = ROOT / "Cargo.toml"
-LOCK = ROOT / "Cargo.lock"
-PACKAGE = "folder-history"
+MANIFEST = ROOT / 'Cargo.toml'
+LOCK = ROOT / 'Cargo.lock'
+PACKAGE = 'folder-history'
+VERSION_FILES = {'Cargo.toml', 'Cargo.lock'}
 
 
-def run(*args: str) -> None:
+def command(*args, check=True):
+    return subprocess.run(args, cwd=ROOT, text=True, capture_output=True, check=check)
+
+
+def run(*args):
+    print('+', ' '.join(args), flush=True)
     subprocess.run(args, cwd=ROOT, check=True)
 
 
-def output(*args: str) -> str:
-    return subprocess.check_output(args, cwd=ROOT, text=True).strip()
+def output(*args):
+    return command(*args).stdout.strip()
 
 
-def current_version() -> str:
-    manifest = MANIFEST.read_text()
-    package = manifest.split("[package]", 1)[1].split("\n[", 1)[0]
-    match = re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', package, re.M)
+def version():
+    text = MANIFEST.read_text()
+    match = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
     if not match:
-        raise RuntimeError("Cannot find simple semver in Cargo.toml [package]")
-    return match.group(1)
+        raise RuntimeError('Missing [package] in Cargo.toml')
+    found = re.search(r'^version\s*=\s*"(\d+\.\d+\.\d+)"', match.group(1), re.M)
+    if not found:
+        raise RuntimeError('Cannot find package semver')
+    return found.group(1)
 
 
-def check_version_files_clean() -> None:
-    # Unrelated work is allowed during a version bump. Never overwrite
-    # existing edits to either version file, including staged changes.
-    changes = output("git", "status", "--porcelain", "--", "Cargo.toml", "Cargo.lock")
-    if changes:
-        raise RuntimeError(
-            "Version files already modified; inspect them before bumping:\n" + changes
-        )
+def changed_paths():
+    raw = command('git', 'status', '--porcelain', '-z').stdout
+    parts = raw.split('\0')
+    paths = []
+    i = 0
+    while i < len(parts) and parts[i]:
+        entry = parts[i]
+        paths.append(entry[3:])
+        if entry[:2][0] in 'RC' or entry[:2][1] in 'RC':
+            i += 1  # rename/copy also reports original path
+        i += 1
+    return paths
 
 
-def bump(kind: str) -> None:
-    check_version_files_clean()
-    old = current_version()
-    major, minor, patch = map(int, old.split("."))
-    if kind == "major":
+def tag_exists(tag):
+    return command('git', 'show-ref', '--verify', '--quiet', 'refs/tags/' + tag, check=False).returncode == 0
+
+
+def remote_tag_exists(tag):
+    result = command('git', 'ls-remote', '--exit-code', '--tags', 'origin', 'refs/tags/' + tag, check=False)
+    if result.returncode not in (0, 2):
+        raise RuntimeError('Cannot check remote tag on origin: ' + result.stderr.strip())
+    return result.returncode == 0
+
+
+def check_lock(v):
+    if not re.search(r'(?m)^name = "' + re.escape(PACKAGE) + r'"\nversion = "' + re.escape(v) + r'"$', LOCK.read_text()):
+        raise RuntimeError('Cargo.lock package version differs from Cargo.toml')
+
+
+def bump(kind):
+    dirty = set(changed_paths()) & VERSION_FILES
+    if dirty:
+        raise RuntimeError('Version files already modified: ' + ', '.join(sorted(dirty)))
+    old = version()
+    major, minor, patch = map(int, old.split('.'))
+    if kind == 'major':
         major, minor, patch = major + 1, 0, 0
-    elif kind == "minor":
+    elif kind == 'minor':
         minor, patch = minor + 1, 0
     else:
         patch += 1
-    new = f"{major}.{minor}.{patch}"
-    tag = f"v{new}"
-    if subprocess.run(["git", "rev-parse", "--verify", "refs/tags/" + tag], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        raise RuntimeError(f"Tag {tag} already exists")
+    new = f'{major}.{minor}.{patch}'
+    tag = 'v' + new
+    if tag_exists(tag) or remote_tag_exists(tag):
+        raise RuntimeError(f'{tag} already exists locally or on origin')
     manifest = MANIFEST.read_text()
-    package = manifest.split("[package]", 1)[1].split("\n[", 1)[0]
-    updated = re.sub(r'(?m)^(version\s*=\s*")' + re.escape(old) + r'(")', lambda m: m.group(1) + new + m.group(2), package, count=1)
-    MANIFEST.write_text(manifest.replace(package, updated, 1))
+    package = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', manifest)
+    updated_package = re.sub(r'(?m)^(version\s*=\s*")' + re.escape(old) + r'(")',
+                             lambda m: m.group(1) + new + m.group(2), package.group(1), count=1)
     lock = LOCK.read_text()
-    pattern = r'(?m)(^name = "' + re.escape(PACKAGE) + r'"\nversion = ")' + re.escape(old) + r'("$)'
-    updated_lock, count = re.subn(pattern, lambda m: m.group(1) + new + m.group(2), lock, count=1)
+    updated_lock, count = re.subn(r'(?m)(^name = "' + re.escape(PACKAGE) + r'"\nversion = ")' + re.escape(old) + r'("$)',
+                                   lambda m: m.group(1) + new + m.group(2), lock, count=1)
     if count != 1:
-        MANIFEST.write_text(manifest)
-        raise RuntimeError("Cannot find current package version in Cargo.lock")
+        raise RuntimeError('Cannot locate package version in Cargo.lock; no files changed')
+    MANIFEST.write_text(manifest[:package.start(1)] + updated_package + manifest[package.end(1):])
     LOCK.write_text(updated_lock)
-    print(f"Bumped {old} -> {new}. Review changes, then run: make release")
+    print(f'Bumped {old} -> {new}; run make release when ready.')
 
 
-def release() -> None:
-    version = current_version()
-    tag = f"v{version}"
-    branch = output("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+def state():
+    v = version()
+    tag = 'v' + v
+    branch_result = command('git', 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    dirty = changed_paths()
+    remote = remote_tag_exists(tag)
+    local = tag_exists(tag)
+    return v, tag, branch, dirty, local, remote
+
+
+def status():
+    v, tag, branch, dirty, local, remote = state()
+    print(f'Version: {v}  Tag: {tag}  Branch: {branch or "DETACHED"}')
+    print(f'Local tag: {"present" if local else "absent"}  Origin tag: {"present" if remote else "absent"}')
+    print('Working tree:', 'clean' if not dirty else ', '.join(dirty))
+    if remote:
+        print('Next action: already published; bump the version for another release.')
+    elif not branch:
+        print('Next action: check out a branch before releasing.')
+    elif set(dirty) - VERSION_FILES:
+        print('Next action: commit/stash unrelated changes before release.')
+    elif local:
+        print('Next action: verify local tag and push it (make release).')
+    else:
+        print('Next action: test, commit version changes if any, tag and push (make release).')
+
+
+def release():
+    v, tag, branch, dirty, local, remote = state()
+    check_lock(v)
     if not branch:
-        raise RuntimeError("Detached HEAD; refusing release")
-    # Only the two version files may be modified; all other changes must be committed.
-    changes = output("git", "status", "--porcelain").splitlines()
-    if any(line[3:] not in ("Cargo.toml", "Cargo.lock") for line in changes):
-        raise RuntimeError("Unrelated uncommitted changes; commit/stash first")
-    if output("git", "tag", "--list", tag):
-        raise RuntimeError(f"Tag {tag} already exists")
-    if not changes:
-        raise RuntimeError("No version changes to release; run make bump-patch/minor/major")
-    # Avoid publishing a version that does not match the lockfile.
-    if f'name = "{PACKAGE}"\nversion = "{version}"' not in LOCK.read_text():
-        raise RuntimeError("Cargo.lock version does not match Cargo.toml")
-    run("cargo", "test", "-r", "--locked")
-    run("git", "add", "Cargo.toml", "Cargo.lock")
-    run("git", "commit", "-m", f"Release {tag}")
-    run("git", "tag", tag)
-    run("git", "push", "origin", branch)
-    run("git", "push", "origin", tag)
-    print(f"Pushed {tag}; GitHub Actions will build the release.")
+        raise RuntimeError('Detached HEAD; refusing release')
+    unrelated = set(dirty) - VERSION_FILES
+    if unrelated:
+        raise RuntimeError('Unrelated changes must be committed/stashed: ' + ', '.join(sorted(unrelated)))
+    if remote:
+        if not local:
+            raise RuntimeError(f'{tag} exists on origin but not locally; fetch tags and inspect')
+        print(f'{tag} is already published. Nothing to do.')
+        return
+    if local and dirty:
+        raise RuntimeError(f'{tag} is already tagged, but version files are modified; inspect first')
+    if local:
+        tagged_head = output('git', 'rev-list', '-n', '1', tag)
+        head = output('git', 'rev-parse', 'HEAD')
+        if tagged_head != head:
+            raise RuntimeError(f'{tag} points to a different commit; refusing to move it')
+    print(f'Releasing {tag} on {branch}', flush=True)
+    run('cargo', 'test', '-r', '--locked')
+    if dirty:
+        run('git', 'add', '--', 'Cargo.toml', 'Cargo.lock')
+        run('git', 'commit', '-m', f'Release {tag}')
+    if not local:
+        run('git', 'tag', tag)
+    # Atomic push avoids publishing the tag without the corresponding branch.
+    run('git', 'push', '--atomic', 'origin', branch, tag)
+    print(f'Published {tag}; GitHub Actions can now build the binaries.')
 
 
-def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("show", "patch", "minor", "major", "release"):
-        raise SystemExit("Usage: bump_version.py {show|patch|minor|major|release}")
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('show', 'status', 'patch', 'minor', 'major', 'release'):
+        raise SystemExit('Usage: bump_version.py {show|status|patch|minor|major|release}')
     action = sys.argv[1]
-    if action == "show":
-        print(current_version())
-    elif action == "release":
+    if action == 'show':
+        print(version())
+    elif action == 'status':
+        status()
+    elif action == 'release':
         release()
     else:
         bump(action)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         main()
-    except (RuntimeError, subprocess.CalledProcessError) as error:
-        sys.exit(f"ERROR: {error}")
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        sys.exit(f'ERROR: {exc}')
