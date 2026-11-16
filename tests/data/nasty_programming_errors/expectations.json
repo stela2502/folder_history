@@ -1,0 +1,221 @@
+{
+  "01_valid_multiline_read_write": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/normalized.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "02_broken_read_followed_by_write_same_cell": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/rescued.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "03_broken_write_followed_by_read_same_cell": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/broken_existing.tsv"
+      },
+      {
+        "kind": "reads",
+        "target": "inputs/other.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "04_broken_write_missing_output": {
+    "expected_edges": [],
+    "forbidden_targets": [
+      "never_generated.tsv"
+    ]
+  },
+  "05_broken_read_missing_input": {
+    "expected_edges": [],
+    "forbidden_targets": [
+      "never_existed.h5ad"
+    ]
+  },
+  "06_broken_then_next_cell": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/broken_existing.tsv"
+      },
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/after_broken.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "07_nested_multiline": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/nested.tsv"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "08_filename_keyword_late": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/keyword.tsv"
+      }
+    ],
+    "forbidden_targets": [
+      "decoy.tsv"
+    ]
+  },
+  "09_variable_assignment_and_reassignment": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/fresh.tsv"
+      }
+    ],
+    "forbidden_targets": [
+      "stale.tsv"
+    ]
+  },
+  "10_comments_strings_magics": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/actual.tsv"
+      }
+    ],
+    "forbidden_targets": [
+      "decoy.tsv"
+    ]
+  },
+  "11_fstring_and_path_join": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/A_stats.tsv"
+      },
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "12_read_10x_mex": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/mex/matrix.mtx.gz"
+      },
+      {
+        "kind": "reads",
+        "target": "inputs/mex/features.tsv.gz"
+      },
+      {
+        "kind": "reads",
+        "target": "inputs/mex/barcodes.tsv.gz"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "13_realistic_scRNA_pipeline": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/filtered.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/qc.tsv"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "14_r_and_seurat": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/r_processed.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/r_markers.csv"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "15_double_broken_calls": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/rescued.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/actual.tsv"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "16_quoted_parentheses_and_braces": {
+    "expected_edges": [
+      {
+        "kind": "writes",
+        "target": "results/quoted.tsv"
+      }
+    ],
+    "forbidden_targets": [
+      "ghost.h5ad"
+    ]
+  },
+  "17_missing_fstring_recovery": {
+    "expected_edges": [
+      {
+        "kind": "reads",
+        "target": "inputs/raw.h5ad"
+      },
+      {
+        "kind": "writes",
+        "target": "results/after_broken.h5ad"
+      }
+    ],
+    "forbidden_targets": []
+  },
+  "18_valid_missing_output": {
+    "expected_edges": [],
+    "forbidden_targets": []
+  }
+}
