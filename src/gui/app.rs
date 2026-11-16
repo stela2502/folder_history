@@ -1,0 +1,930 @@
+use crate::*;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Tab { Search, Graph, Build, Spectator }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NavState { tab: Tab, selected: Option<i64> }
+
+// The database stores archive-relative paths. Never pass these directly to the OS.
+pub(crate) fn reveal_in_file_manager(root: &Path, relative: &str) -> io::Result<()> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsafe archive-relative path"));
+    }
+    let absolute = root.join(candidate);
+    let directory = if absolute.is_dir() { absolute } else {
+        absolute.parent().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?.to_path_buf()
+    };
+    if !directory.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Directory does not exist: {}", directory.display())));
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = Command::new("explorer.exe"); c.arg(&directory); c };
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = Command::new("open"); c.arg(&directory); c };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = { let mut c = Command::new("xdg-open"); c.arg(&directory); c };
+    #[cfg(not(any(windows, unix)))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "No file manager launcher for this OS"));
+    #[cfg(any(windows, unix))]
+    { cmd.spawn().map(|_| ()) }
+}
+
+// Open only indexed archive-relative files; never execute a directory or missing path.
+pub(crate) fn open_indexed_file(root: &Path, relative: &str) -> io::Result<()> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() || candidate.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsafe archive-relative path"));
+    }
+    let absolute = root.join(candidate);
+    if !absolute.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("File does not exist: {}", absolute.display())));
+    }
+    #[cfg(target_os = "windows")]
+    let mut cmd = { let mut c = Command::new("powershell.exe"); let escaped = absolute.to_string_lossy().replace("'", "''"); c.args(["-NoProfile", "-NonInteractive", "-Command", &format!("Invoke-Item -LiteralPath '{escaped}'")]); c };
+    #[cfg(target_os = "macos")]
+    let mut cmd = { let mut c = Command::new("open"); c.arg(&absolute); c };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = { let mut c = Command::new("xdg-open"); c.arg(&absolute); c };
+    #[cfg(not(any(windows, unix)))]
+    return Err(io::Error::new(io::ErrorKind::Unsupported, "No file opener for this OS"));
+    #[cfg(any(windows, unix))]
+    { cmd.spawn().map(|_| ()) }
+}
+
+// Candidate analysis membership is advisory. Never write these scores to the
+// provenance graph: directory similarity is not evidence of a processing edge.
+pub(crate) fn issue_analysis_candidates(
+    issue: &Issue,
+    assignment: &HashMap<String, String>,
+    artifacts: &[Artifact],
+    relations: &[Relation],
+) -> Vec<(String, u32, String)> {
+    let mut candidates: HashMap<String, (u32, Vec<&'static str>)> = HashMap::new();
+    let mut add = |path: &str, score: u32, reason: &'static str| {
+        if let Some(group) = assignment.get(path) {
+            let entry = candidates.entry(group.clone()).or_insert((0, Vec::new()));
+            if score > entry.0 { entry.0 = score; }
+            if !entry.1.contains(&reason) { entry.1.push(reason); }
+        }
+    };
+    // Source notebook/script is the strongest existing assignment evidence.
+    add(&issue.notebook, 100, "source script belongs to analysis");
+    // Explicitly recorded provenance links, not inferred directory links.
+    for edge in relations {
+        if edge.source == issue.notebook { add(&edge.target, 85, "recorded downstream link"); }
+        if edge.target == issue.notebook { add(&edge.source, 85, "recorded upstream link"); }
+    }
+    let target_name = Path::new(&issue.filename).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for artifact in artifacts {
+        if artifact.path == issue.filename {
+            add(&artifact.path, 95, "exact indexed path");
+        } else if !target_name.is_empty() && Path::new(&artifact.path).file_name().and_then(|n| n.to_str()) == Some(target_name) {
+            add(&artifact.path, 50, "matching basename (ambiguous)");
+        }
+    }
+    let mut ranked: Vec<_> = candidates.into_iter()
+        .map(|(group, (score, reasons))| (group, score, reasons.join("; "))).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+pub(crate) enum ScanEvent { Progress(String), Finished(Result<ScanResult, String>), Resolved(Result<(i64, i64), String>) }
+
+pub(crate) struct App {
+    pub(crate) root: Option<PathBuf>, pub(crate) db: Option<Connection>, pub(crate) writable: bool, pub(crate) index_path: Option<PathBuf>,
+    pub(crate) tab: Tab, pub(crate) query: String, pub(crate) artifacts: Vec<Artifact>, pub(crate) relations: Vec<Relation>,
+    pub(crate) selected: Option<i64>, pub(crate) status: String, pub(crate) from: String, pub(crate) to: String,
+    pub(crate) relation_kind: String, pub(crate) note: String, pub(crate) show_all: bool, pub(crate) issues: Vec<Issue>, pub(crate) issue_filter: String, pub(crate) active_dependency: Option<(String,String)>, pub(crate) resolution_note: String, pub(crate) scan_summary: String,
+    pub(crate) group_filter: String, pub(crate) group_names: HashMap<String, String>, pub(crate) group_name_edit: String,
+    pub(crate) analysis_groups: Vec<analysis_graph::AnalysisGroup>, pub(crate) analysis_assignment: HashMap<String, String>,
+    pub(crate) nav_history: Vec<NavState>, pub(crate) nav_cursor: usize,
+    pub(crate) recent_folders: Vec<PathBuf>, pub(crate) include_hidden: bool, pub(crate) scan_events: Option<Receiver<ScanEvent>>, pub(crate) scan_cancel: Option<Arc<AtomicBool>>,
+}
+impl Default for App {
+    fn default() -> Self {
+        Self { root: None, db: None, writable: false, index_path: None, tab: Tab::Search,
+            query: String::new(), artifacts: vec![], relations: vec![], selected: None,
+            status: "Open a research folder to begin.".into(), from: String::new(),
+            to: String::new(), relation_kind: "derived_from".into(), note: String::new(),
+            show_all: false, issues: vec![], issue_filter: "all".into(), active_dependency: None, resolution_note: String::new(), scan_summary: String::new(),
+            group_filter: String::new(), group_names: HashMap::new(), group_name_edit: String::new(),
+            analysis_groups: Vec::new(), analysis_assignment: HashMap::new(),
+            nav_history: vec![], nav_cursor: 0,
+            recent_folders: load_recent_folders(), include_hidden: false, scan_events: None, scan_cancel: None }
+    }
+}
+
+// Plain UTF-8 file: one absolute folder path per line, newest first.
+// This list contains only folder names, never data or manual resolutions.
+pub(crate) fn recent_folders_file() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| PathBuf::from(home).join(".folder_history/recent_folders.txt"))
+}
+pub(crate) fn load_recent_folders() -> Vec<PathBuf> {
+    let Some(path) = recent_folders_file() else { return Vec::new(); };
+    std::fs::read_to_string(path).unwrap_or_default().lines()
+        .filter(|line| !line.is_empty()).take(5).map(PathBuf::from).collect()
+}
+pub(crate) fn save_recent_folders(folders: &[PathBuf]) -> Result<()> {
+    let Some(path) = recent_folders_file() else { return Ok(()); };
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let contents = folders.iter().map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>().join("\n") + "\n";
+    // Atomic replacement avoids a truncated list if the application exits during writing.
+    let temporary = path.with_extension("txt.tmp");
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+impl App {
+    pub(crate) fn open(&mut self, root: PathBuf, analyze: bool) {
+        let path = local_index_path(&root);
+        let result: Result<Connection> = (|| {
+            if !root.is_dir() { anyhow::bail!("Folder does not exist: {}", root.display()); }
+            if analyze {
+                import_existing_index(&root, &path)?;
+                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+            } else if !path.is_file() {
+                // Read the old portable index directly in Spectator mode. Importing
+                // is a separate, explicit Build operation and must not be required
+                // merely to browse an archive.
+                let old = root.join(".folder-history/history.sqlite");
+                if !old.is_file() {
+                    anyhow::bail!("No FolderHistory database found in .folder_history or .folder-history");
+                }
+            }
+            let open_path = if !analyze && !path.is_file() {
+                root.join(".folder-history/history.sqlite")
+            } else { path.clone() };
+            let flags = if analyze {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+            } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
+            let db = Connection::open_with_flags(&open_path, flags)
+                .with_context(|| format!("Opening {}", open_path.display()))?;
+            if analyze { schema(&db)?; }
+            Ok(db)
+        })();
+        match result {
+            Ok(db) => {
+                self.recent_folders.retain(|p| p != &root);
+                self.recent_folders.insert(0, root.clone());
+                self.recent_folders.truncate(5);
+                let recent_save_error = save_recent_folders(&self.recent_folders).err();
+                self.nav_history.clear(); self.nav_cursor = 0;
+                self.root = Some(root); self.db = Some(db); self.writable = analyze;
+                self.index_path = Some(if !analyze && !path.is_file() {
+                    self.root.as_ref().unwrap().join(".folder-history/history.sqlite")
+                } else { path.clone() });
+                self.selected = None; self.active_dependency = None; self.group_filter.clear();
+                self.tab = if analyze { Tab::Build } else { Tab::Spectator };
+                self.refresh(); self.status = format!("Opened index {}", self.index_path.as_ref().unwrap().display());
+                if let Some(e) = recent_save_error {
+                    self.status.push_str(&format!(" (could not save recent folders: {e})"));
+                }
+            }
+            Err(e) => self.status = format!("Cannot open folder history: {e:#}"),
+        }
+    }
+    pub(crate) fn refresh(&mut self) {
+        self.artifacts.clear(); self.relations.clear(); self.issues.clear(); self.group_names.clear();
+        self.analysis_groups.clear(); self.analysis_assignment.clear();
+        let Some(db) = &self.db else { return; };
+        let result: Result<(Vec<Artifact>, Vec<Relation>, Vec<Issue>)> = (|| {
+            let mut q = db.prepare("SELECT id,path,kind FROM artifacts ORDER BY path")?;
+            let artifacts = q.query_map([], |r| Ok(Artifact { id:r.get(0)?,path:r.get(1)?,kind:r.get(2)? }))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = db.prepare("SELECT id,source,target,kind,evidence,manual FROM relations ORDER BY id")?;
+            let relations = q.query_map([], |r| Ok(Relation { id:r.get(0)?,source:r.get(1)?,target:r.get(2)?,kind:r.get(3)?,evidence:r.get(4)?,manual:r.get::<_,i32>(5)? != 0 }))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut q = db.prepare("SELECT id,notebook,cell,filename,category,decision,note FROM issues ORDER BY category,notebook,cell")?;
+            let issues = q.query_map([], |r| Ok(Issue { id:r.get(0)?, notebook:r.get(1)?, cell:r.get(2)?, filename:r.get(3)?, category:r.get(4)?, decision:r.get(5)?, note:r.get(6)? }))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((artifacts, relations, issues))
+        })();
+        match result { Ok((a,r,i)) => { self.artifacts=a;self.relations=r;self.issues=i; }, Err(e) => self.status=format!("Database error: {e:#}") }
+        self.analysis_groups = analysis_graph::detect(&self.artifacts, &self.relations);
+        for group in &self.analysis_groups {
+            for path in &group.paths { self.analysis_assignment.insert(path.clone(), group.key.clone()); }
+        }
+        if let Some(db) = &self.db {
+            if let Ok(mut q) = db.prepare("SELECT source_folder,display_name FROM analysis_names") {
+                if let Ok(rows) = q.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))) {
+                    self.group_names = rows.flatten().collect();
+                }
+            }
+        }
+    }
+    pub(crate) fn selected_path(&self) -> Option<String> {
+        self.artifacts.iter().find(|a| Some(a.id)==self.selected).map(|a| a.path.clone())
+    }
+    pub(crate) fn add_manual(&mut self) {
+        if !self.writable { return; }
+        if let Some(db) = &self.db {
+            if !self.artifacts.iter().any(|a| a.path == self.from.trim()) || !self.artifacts.iter().any(|a| a.path == self.to.trim()) { self.status="Both paths must be indexed files inside this archive.".into(); return; }
+            match add_relation(db, self.from.trim(), self.to.trim(), self.relation_kind.trim(), self.note.trim(), true) {
+                Ok(()) => { self.refresh(); self.publish(); },
+                Err(e) => self.status=format!("Save failed: {e:#}"),
+            }
+        }
+    }
+    // A resolution belongs to the dependency, not to an individual notebook cell.
+    // The existing issue table remains the source of occurrence-level evidence.
+    pub(crate) fn resolve_dependency(&mut self, category: &str, filename: &str, decision: &str, note: &str) {
+        if !self.writable { return; }
+        let Some(db) = &mut self.db else { return; };
+        let result: Result<usize> = (|| {
+            let tx = db.transaction()?;
+            let changed = tx.execute(
+                "UPDATE issues SET decision=?1,note=?2 WHERE category=?3 AND filename=?4",
+                params![decision,note,category,filename])?;
+            tx.commit()?;
+            Ok(changed)
+        })();
+        match result {
+            Ok(changed) => {
+                if category == "external" && decision == "intentional_external" {
+                    if let Err(e) = save_global_external_link(filename,note.trim()) {
+                        self.status = format!("Local resolution saved, global registry failed: {e}");
+                    }
+                }
+                self.refresh();
+                self.status = format!("Updated {changed} occurrences of {filename}; changes saved to local index.");
+            }
+            Err(e) => self.status = format!("Dependency resolution failed: {e:#}"),
+        }
+    }
+    pub(crate) fn publish(&mut self) {
+        // The live database is already stored with the researcher's files.
+        // Checkpoint WAL so copying the folder needs only history.sqlite.
+        if let Some(db) = &self.db {
+            match db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                Ok(()) => self.status = "Project history already stored in .folder_history/history.sqlite".into(),
+                Err(e) => self.status = format!("Checkpoint failed: {e}"),
+            }
+        }
+    }
+    pub(crate) fn begin_scan(&mut self) {
+        if self.scan_events.is_some() || !self.writable { return; }
+        let (Some(root), Some(index)) = (self.root.clone(), self.index_path.clone()) else { return; };
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let hidden = self.include_hidden;
+        self.scan_events = Some(rx);
+        self.scan_cancel = Some(cancel);
+        self.scan_summary = "Re-scan started: inventory and provenance extraction running...".into();
+        self.status = "Re-scan running; existing results remain available until completion.".into();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<ScanResult> {
+                let mut db = Connection::open(index)?;
+                schema(&db)?;
+                scan(&mut db, &root, hidden, &worker_cancel, |message| {
+                    let _ = tx.send(ScanEvent::Progress(message));
+                })
+            })().map_err(|e| format!("{e:#}"));
+            let _ = tx.send(ScanEvent::Finished(result));
+        });
+    }
+    pub(crate) fn begin_relink(&mut self) {
+        if self.scan_events.is_some() || !self.writable { return; }
+        let Some(index) = self.index_path.clone() else { return; };
+        let (tx, rx) = mpsc::channel();
+        self.scan_events = Some(rx);
+        self.status = "Re-evaluating stored provenance evidence (no filesystem scan)...".into();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(i64, i64)> {
+                let mut db = Connection::open(index)?;
+                schema(&db)?;
+                relink_cached_evidence(&mut db)
+            })().map_err(|e| format!("{e:#}"));
+            let _ = tx.send(ScanEvent::Resolved(result));
+        });
+    }
+    pub(crate) fn poll_scan(&mut self) {
+        let mut finished = None;
+        let mut resolved = None;
+        if let Some(rx) = &self.scan_events {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    ScanEvent::Progress(message) => self.scan_summary = message,
+                    ScanEvent::Finished(result) => { finished = Some(result); break; }
+                    ScanEvent::Resolved(result) => { resolved = Some(result); break; }
+                }
+            }
+        }
+        if let Some(result) = resolved {
+            self.scan_events = None;
+            match result {
+                Ok((notebooks, chains)) => {
+                    self.refresh();
+                    self.status = format!("Re-resolved cached evidence: {notebooks} notebook candidates, {chains} script-chain candidates. Manual resolutions preserved.");
+                    self.scan_summary = self.status.clone();
+                    self.publish();
+                }
+                Err(e) => self.status = format!("Re-resolve failed: {e}"),
+            }
+        }
+        if let Some(result) = finished {
+            self.scan_events = None;
+            self.scan_cancel = None;
+            match result {
+                Ok(r) => {
+                    self.scan_summary = format!("Inventory: {} files | Scripts: {} found, {} parsed | Shell steps: {} | Extracted references: {} | Warnings: {}",r.files,r.scripts,r.parsed,r.steps,r.links,r.warnings);
+                    self.status = self.scan_summary.clone();
+                    self.refresh();
+                    self.publish();
+                }
+                Err(e) => {
+                    self.scan_summary = format!("Re-scan did not complete: {e}");
+                    self.status = self.scan_summary.clone();
+                },
+            }
+        }
+    }
+    // Diagnostics are deliberately archive-relative and bounded for sharing.
+    // Do not include raw command strings or evidence: they may embed private absolute paths.
+    pub(crate) fn diagnostic_report(&self, detailed: bool) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from("# FolderHistory diagnostic report\n\n");
+        out.push_str("Scanner schema: v2 | Application: FolderHistory v0.2\n");
+        out.push_str("Archive location and local index path: omitted for portability.\n\n");
+        let _ = writeln!(out, "- Indexed files: {}", self.artifacts.len());
+        let _ = writeln!(out, "- Relationships: {} (manual: {})", self.relations.len(), self.relations.iter().filter(|r| r.manual).count());
+        let _ = writeln!(out, "- Issues: {}", self.issues.len());
+        let _ = writeln!(out, "- Current scan status: {}", if self.scan_events.is_some() { "running" } else { "idle" });
+        let _ = writeln!(out, "- Last scan message: {}", report_safe(&self.scan_summary));
+        let mut kinds = std::collections::BTreeMap::<&str,usize>::new();
+        for a in &self.artifacts { *kinds.entry(&a.kind).or_default() += 1; }
+        out.push_str("\n## Inventory by type\n");
+        for (kind,count) in kinds { let _ = writeln!(out, "- {kind}: {count}"); }
+        let mut categories = std::collections::BTreeMap::<(&str,&str),usize>::new();
+        for issue in &self.issues { *categories.entry((&issue.category,&issue.decision)).or_default() += 1; }
+        out.push_str("\n## Issue counts (category / decision)\n");
+        for ((cat,decision),count) in categories { let _ = writeln!(out, "- {cat} / {decision}: {count}"); }
+        if let Some(db) = &self.db {
+            let stats = db.query_row("SELECT files,steps,links FROM scans WHERE completed=1 ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)));
+            match stats {
+                Ok((files,steps,links)) => { let _ = writeln!(out, "\n## Last completed scan\n- Files: {files}\n- Shell steps: {steps}\n- Extracted references: {links}"); },
+                Err(_) => out.push_str("\n## Last completed scan\nNo completed scan recorded.\n"),
+            }
+            let count = |sql: &str| db.query_row(sql, [], |r| r.get::<_,i64>(0)).unwrap_or(0);
+            let _ = writeln!(out, "- Stored processing steps: {}",count("SELECT count(*) FROM steps"));
+            let _ = writeln!(out, "- Stored step inputs: {}",count("SELECT count(*) FROM step_io WHERE direction='reads'"));
+            let _ = writeln!(out, "- Stored step outputs: {}",count("SELECT count(*) FROM step_io WHERE direction='writes'"));
+            let _ = writeln!(out, "- Suspected copied folders: {}",count("SELECT count(*) FROM timestamp_assessments WHERE suspected_copy=1"));
+            let _ = writeln!(out, "- Inferred script-order links: {}",count("SELECT count(*) FROM inferred_links"));
+            let _ = writeln!(out, "- Script files without recorded processing steps: {}",count("SELECT count(*) FROM artifacts a WHERE a.kind='script' AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.source=a.path)"));
+            if detailed {
+                out.push_str("\n## Timestamp reliability (suspected copy batches, up to 30)\n");
+                if let Ok(mut q) = db.prepare("SELECT folder,files,correlation,transfer_mb_s FROM timestamp_assessments WHERE suspected_copy=1 ORDER BY files DESC LIMIT 30") {
+                    if let Ok(rows) = q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?))) {
+                        for row in rows.flatten() { let _=writeln!(out,"- {}: {} files; size/time r={:.3}; ~{:.1} MB/s (suspected copy, not proof)",report_safe(&row.0),row.1,row.2,row.3); }
+                    }
+                }
+                out.push_str("\n## Inferred script-order chains (up to 30)\n");
+                if let Ok(mut q) = db.prepare("SELECT source,target FROM inferred_links ORDER BY source,target LIMIT 30") {
+                    if let Ok(rows) = q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))) {
+                        for row in rows.flatten() { let _=writeln!(out,"- {} -> {} (candidate)",report_safe(&row.0),report_safe(&row.1)); }
+                    }
+                }
+                out.push_str("\n## Scripts without extracted steps (up to 100)\n");
+                if let Ok(mut q) = db.prepare("SELECT a.path FROM artifacts a WHERE a.kind='script' AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.source=a.path) ORDER BY a.path LIMIT 100") {
+                    if let Ok(rows) = q.query_map([],|r|r.get::<_,String>(0)) {
+                        for row in rows.flatten() { let _=writeln!(out,"- {}",report_safe(&row)); }
+                    }
+                }
+                out.push_str("\n## Sample extracted step I/O (up to 100)\n");
+                if let Ok(mut q) = db.prepare("SELECT s.source,s.ordinal,io.direction,io.artifact FROM steps s JOIN step_io io ON io.step_id=s.id ORDER BY s.source,s.ordinal LIMIT 100") {
+                    if let Ok(rows) = q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))) {
+                        for row in rows.flatten() { let _=writeln!(out,"- {} step {} {} {}",report_safe(&row.0),row.1,row.2,report_safe(&row.3)); }
+                    }
+                }
+            }
+        }
+        if detailed {
+            out.push_str("\n## Issue examples (up to 100 per category)\n");
+            for category in ["external","unresolved","ambiguous"] {
+                let _=writeln!(out,"\n### {category}");
+                for issue in self.issues.iter().filter(|i|i.category==category).take(100) {
+                    let _=writeln!(out,"- {} cell/line {}: `{}` [{}] note: {}",report_safe(&issue.notebook),issue.cell,report_safe(&issue.filename),issue.decision,report_safe(&issue.note));
+                }
+            }
+            out.push_str("\n## Representative relationships (up to 100)\n");
+            for relation in self.relations.iter().take(100) {
+                let _=writeln!(out,"- {} --{}--> {}{}",report_safe(&relation.source),report_safe(&relation.kind),report_safe(&relation.target),if relation.manual {" [manual]"} else {""});
+            }
+        }
+        if let Some(root) = &self.root { out.push_str(&report::markdown(root, &self.artifacts, &self.relations, &self.issues)); }
+        out.push_str("\nRaw script commands, external paths and full evidence intentionally excluded.\n");
+        out
+    }
+    pub(crate) fn export_diagnostic_report(&mut self) {
+        let Some(root) = self.root.as_ref() else { return; };
+        let suggested = root.file_name().and_then(|n|n.to_str()).unwrap_or("archive");
+        let filename = format!("{}-folder-history-diagnostic.md",suggested);
+        let report = self.diagnostic_report(true);
+        if let Some(path) = rfd::FileDialog::new().set_file_name(&filename).add_filter("Markdown", &["md"]).save_file() {
+            match std::fs::write(&path,report) {
+                Ok(()) => self.status=format!("Diagnostic report saved to {}",path.display()),
+                Err(e) => self.status=format!("Diagnostic export failed: {e}"),
+            }
+        }
+    }
+    pub(crate) fn export_readme(&mut self) {
+        let Some(root) = self.root.clone() else { return; };
+        let esc = |v: &str| v.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;");
+        let mut html = String::from("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>FolderHistory archive report</title><style>body{font:16px system-ui;max-width:1000px;margin:3em auto;padding:0 1em;background:#16191e;color:#eee}a{color:#9ccaff}article{border:1px solid #555;padding:1em;margin:1em 0;border-radius:8px}small{color:#bbb}</style><h1>Research archive — FolderHistory</h1>");
+        html.push_str(&format!("<p>{} indexed files, {} relationships, {} issues.</p>",self.artifacts.len(),self.relations.len(),self.issues.len()));
+        for category in ["external","unresolved","ambiguous"] {
+            html.push_str(&format!("<h2>{}</h2>",esc(category)));
+            for i in self.issues.iter().filter(|i| i.category == category) {
+                let href = i.notebook.split('/').map(|x| x.replace(' ',"%20")).collect::<Vec<_>>().join("/");
+                html.push_str(&format!("<article><a href=\"{}\">{}</a> — cell {}<p>Reference: <code>{}</code></p><small>Status: {} — {}</small></article>",esc(&href),esc(&i.notebook),i.cell,esc(&i.filename),esc(&i.decision),esc(&i.note)));
+            }
+        }
+        let findings = report::markdown(&root, &self.artifacts, &self.relations, &self.issues);
+        html.push_str("<h2>Archive handover findings</h2><pre style=\"white-space:pre-wrap;overflow-wrap:anywhere\">");
+        html.push_str(&esc(&findings));
+        html.push_str("</pre><p>Paths in this report are relative to the archive. External source directories are intentionally omitted.</p></html>");
+        match std::fs::File::create(root.join("README.html")).and_then(|mut f| f.write_all(html.as_bytes())) {
+            Ok(()) => self.status="Generated README.html in archive root.".into(),
+            Err(e) => self.status=format!("README export failed: {e}"),
+        }
+    }
+}
+
+/*
+// The first path component is the stable provisional analysis/sample group.
+// Cross-folder edges remain edges: they never merge groups. Root-level files
+// remain visible in their own group.
+pub(crate) fn source_group(path: &str) -> String {
+    let normalized = path.trim_start_matches("./").replace('\\', "/");
+    normalized.split_once('/').map(|(first, _)| first).unwrap_or("(archive root)").to_owned()
+}
+*/
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_scan();
+        if self.scan_events.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(150)); }
+        // Record user navigation once per frame; Back/Forward do not create new entries.
+        let before = NavState { tab: self.tab, selected: self.selected };
+        let mut history_navigation = false;
+        let back_key = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft));
+        let forward_key = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight));
+        let home_key = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Home));
+        ctx.set_visuals(egui::Visuals::dark());
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("FolderHistory");
+                if ui.add_enabled(self.scan_events.is_none(), egui::Button::new("Analyze a folder")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, true); }
+                }
+                if ui.add_enabled(self.scan_events.is_none(), egui::Button::new("Open existing history")).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, false); }
+                }
+                if self.db.is_some() {
+                    ui.label(if self.writable { "Index: local, writable" } else { "Index: read-only" });
+                }
+            });
+            ui.horizontal(|ui| {
+                if self.nav_history.is_empty() { self.nav_history.push(before); self.nav_cursor = 0; }
+                let back = ui.add_enabled(self.nav_cursor > 0, egui::Button::new("◀ Back"))
+                    .on_hover_text("Alt+Left").clicked() || back_key;
+                let forward = ui.add_enabled(self.nav_cursor + 1 < self.nav_history.len(), egui::Button::new("Forward ▶"))
+                    .on_hover_text("Alt+Right").clicked() || forward_key;
+                if back && self.nav_cursor > 0 {
+                    self.nav_cursor -= 1;
+                    let state = self.nav_history[self.nav_cursor];
+                    self.tab = state.tab; self.selected = state.selected;
+                    history_navigation = true;
+                } else if forward && self.nav_cursor + 1 < self.nav_history.len() {
+                    self.nav_cursor += 1;
+                    let state = self.nav_history[self.nav_cursor];
+                    self.tab = state.tab; self.selected = state.selected;
+                    history_navigation = true;
+                }
+                if ui.small_button("⌂ Analyses").on_hover_text("Alt+Home").clicked() || home_key {
+                    self.tab = Tab::Spectator;
+                }
+                ui.separator();
+                ui.selectable_value(&mut self.tab, Tab::Search, "Search");
+                ui.selectable_value(&mut self.tab, Tab::Graph, "Relationships");
+                ui.selectable_value(&mut self.tab, Tab::Build, "Build / Repair");
+                ui.selectable_value(&mut self.tab, Tab::Spectator, "Spectator");
+                // Re-evaluate persisted evidence; the full filesystem scan remains in Build / Repair.
+                let button = egui::Button::new(
+                    egui::RichText::new(if self.scan_events.is_some() { "WORKING…" } else { "RE-RESOLVE" })
+                        .strong().color(egui::Color32::WHITE),
+                ).fill(egui::Color32::from_rgb(170, 40, 40));
+                if ui.add_enabled(self.writable && self.db.is_some() && self.scan_events.is_none(), button)
+                    .on_hover_text("Recompute stored notebook and script-chain candidates; no file scan; keep manual resolutions")
+                    .clicked() { self.begin_relink(); }
+
+            });
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| { ui.label(&self.status); });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.db.is_none() {
+                ui.heading("Welcome to FolderHistory");
+                if !self.recent_folders.is_empty() {
+                    ui.add_space(10.0);
+                    ui.heading("Recent folders");
+                    let entries = self.recent_folders.clone();
+                    for folder in entries {
+                        let available = folder.is_dir();
+                        let label = folder.display().to_string();
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(available, egui::Button::new(&label))
+                                .on_hover_text("Open existing history without rescanning")
+                                .clicked() {
+                                // Recent archives are always opened in Spectator mode.
+                                // Build / Repair requires an explicit user action.
+                                self.open(folder.clone(), false);
+                            }
+                            if !available { ui.label("Unavailable"); }
+                            if ui.small_button("×").on_hover_text("Remove from recent list only").clicked() {
+                                self.recent_folders.retain(|p| p != &folder);
+                                if let Err(e) = save_recent_folders(&self.recent_folders) {
+                                    self.status = format!("Cannot save recent folders: {e}");
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                }
+                ui.add_space(16.0);
+                ui.heading("Analyze a folder");
+                ui.label("Select an archive to scan. The history index is published inside the archive.");
+                if ui.button("Choose folder to analyze...").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, true); }
+                }
+                ui.add_space(20.0);
+                ui.heading("Open existing history");
+                ui.label("Browse an existing history database without modifying it.");
+                if ui.button("Choose indexed folder...").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, false); }
+                }
+                ui.add_space(16.0);
+                ui.label("Search and browsing work offline. No AI service is required.");
+                return;
+            }
+            match self.tab {
+                Tab::Spectator => self.show_spectator(ui),
+                Tab::Search => {
+                    ui.heading("Find research data");
+                    ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search filename, sample, notebook, FASTQ, figure..."));
+                    ui.checkbox(&mut self.show_all, "Show all files (without search)");
+                    ui.separator();
+                    let needle = self.query.to_ascii_lowercase();
+                    let matches: Vec<(i64,String,String)> = self.artifacts.iter()
+                        .filter(|a| (self.show_all || !needle.is_empty()) && a.path.to_ascii_lowercase().contains(&needle))
+                        .take(500).map(|a| (a.id,a.path.clone(),a.kind.clone())).collect();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (id,path,kind) in matches {
+                            let response = ui.selectable_label(self.selected==Some(id), format!("[{kind}] {path}"))
+                                .on_hover_text("Double-click to open; right-click for file actions");
+                            response.context_menu(|ui| {
+                                if ui.button("Open file").clicked() {
+                                    if let Some(root) = &self.root { if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); } }
+                                    ui.close();
+                                }
+                                if ui.button("Open containing folder").clicked() {
+                                    if let Some(root) = &self.root { if let Err(e) = reveal_in_file_manager(root, &path) { self.status = format!("Cannot open file manager: {e}"); } }
+                                    ui.close();
+                                }
+                                if ui.button("Copy path").clicked() {
+                                    if let Some(root) = &self.root { ui.ctx().copy_text(root.join(&path).display().to_string()); }
+                                    ui.close();
+                                }
+                            });
+                            if response.double_clicked() {
+                                if let Some(root) = &self.root { if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); } }
+                            } else if response.clicked() { self.selected=Some(id); }
+                            if self.selected == Some(id) {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Open file with default application").clicked() {
+                                        if let Some(root) = &self.root {
+                                            if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); }
+                                        }
+                                    }
+                                    if ui.small_button("Relationships").clicked() { self.tab = Tab::Graph; }
+                                });
+                            }
+                        }
+                    });
+                }
+                Tab::Graph => {
+                    ui.heading("File history");
+                    if let Some(path) = self.selected_path() {
+                        ui.label(format!("Selected: {path}"));
+                        if ui.button("Open file").clicked() {
+                            if let Some(root) = &self.root {
+                                if let Err(e) = open_indexed_file(root, &path) { self.status = format!("Cannot open file: {e}"); }
+                            }
+                        }
+                        if ui.button("📂 Open containing folder").clicked() {
+                            if let Some(root) = &self.root {
+                                if let Err(e) = reveal_in_file_manager(root, &path) {
+                                    self.status = format!("Cannot open file manager: {e}");
+                                }
+                            }
+                        }
+                        ui.separator();
+                        ui.heading("Direct relationships");
+                        let links: Vec<Relation> = self.relations.iter().filter(|r| r.source==path || r.target==path).cloned().collect();
+                        if links.is_empty() { ui.label("No relationships discovered yet."); }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for r in links {
+                                ui.group(|ui| {
+                                    ui.label(format!("{}  —{}→  {}",r.source,r.kind,r.target));
+                                    ui.small(format!("{}{}",r.evidence,if r.manual {" [manual]"} else {""}));
+                                    let other = if r.source==path { &r.target } else { &r.source };
+                                    if let Some(a) = self.artifacts.iter().find(|a| &a.path==other) {
+                                        if ui.button(format!("Explore {}",other)).clicked() { self.selected=Some(a.id); }
+                                    }
+                                });
+                            }
+                        });
+                    } else { ui.label("Select a file in Search to inspect its history."); }
+                }
+                Tab::Build => {
+                    ui.heading("Build / Repair");
+                    if let Some(root) = &self.root { ui.label(format!("Archive: {}", root.display())); }
+                    if let Some(path) = &self.index_path { ui.label(format!("Index: {}", path.display())); }
+                    if !self.writable {
+                        ui.label("Read-only inspection: problems, evidence, and existing resolutions are visible below. To make corrections, use Analyze a folder to create a writable local index; the archive database is not modified.");
+                    }
+                    ui.label(format!("{} indexed files; {} relationships; {} open issue occurrences",self.artifacts.len(),self.relations.len(),self.issues.iter().filter(|issue| issue.decision == "open").count()));
+                    ui.separator();
+                    ui.heading("Analysis graph context");
+                    let previous_group = self.group_filter.clone();
+                    egui::ComboBox::from_id_salt("builder_analysis_group")
+                        .selected_text(if self.group_filter.is_empty() { "All analyses".to_owned() }
+                            else { self.group_names.get(&self.group_filter).cloned().or_else(|| self.analysis_groups.iter().find(|g| g.key==self.group_filter).map(|g|g.suggested_name.clone())).unwrap_or_else(|| self.group_filter.clone()) })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.group_filter, String::new(), "All analyses");
+                            for group in &self.analysis_groups {
+                                let label = self.group_names.get(&group.key).cloned().unwrap_or_else(|| group.suggested_name.clone());
+                                ui.selectable_value(&mut self.group_filter, group.key.clone(), format!("{label} ({} files)",group.paths.len()));
+                            }
+                        });
+                    if self.group_filter != previous_group { self.group_name_edit = self.group_names.get(&self.group_filter).cloned().unwrap_or_default(); }
+                    if !self.group_filter.is_empty() {
+                        if self.group_name_edit.is_empty() { self.group_name_edit = self.group_names.get(&self.group_filter).cloned().unwrap_or_default(); }
+                        if let Some(group) = self.analysis_groups.iter().find(|g|g.key==self.group_filter) {
+                            ui.small(format!("Original source hint: {} · {} connected files",group.source_hint,group.paths.len()));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Analysis name:");
+                            ui.text_edit_singleline(&mut self.group_name_edit);
+                            if ui.add_enabled(self.writable && !self.group_name_edit.trim().is_empty(), egui::Button::new("Save name")).clicked() {
+                                if let Some(db) = &self.db {
+                                    let result = db.execute("INSERT INTO analysis_names(source_folder,display_name) VALUES(?1,?2) ON CONFLICT(source_folder) DO UPDATE SET display_name=excluded.display_name", params![self.group_filter, self.group_name_edit.trim()]);
+                                    match result { Ok(_) => { self.group_names.insert(self.group_filter.clone(), self.group_name_edit.trim().to_owned()); self.status="Analysis name saved".into(); }, Err(e) => self.status=format!("Name save failed: {e}") }
+                                }
+                            }
+                        });
+                    }
+                    ui.small("Issues are organized by their source script's analysis. Candidate assignments below are suggestions, not new provenance edges.");
+                    let unassigned: Vec<&Issue> = self.issues.iter().filter(|i| i.decision == "open" && !self.analysis_assignment.contains_key(&i.notebook)).collect();
+                    ui.collapsing(format!("Unassigned to an analysis · {} issue occurrences", unassigned.len()), |ui| {
+                        let mut by_dependency = BTreeMap::<(String, String), &Issue>::new();
+                        for issue in &unassigned { by_dependency.entry((issue.category.clone(), issue.filename.clone())).or_insert(issue); }
+                        ui.label("Suggestions are ranked from recorded provenance and indexed filename matches. Nothing is assigned automatically.");
+                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                            for ((category, filename), issue) in by_dependency {
+                                let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.link(format!("{filename} · {category}")).clicked() {
+                                        self.active_dependency = Some((category.clone(), filename.clone()));
+                                    }
+                                    if let Some((group, score, reason)) = ranked.first() {
+                                        let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
+                                        ui.label(format!("→ {name} ({score}/100; {reason})"));
+                                        if ui.small_button("View analysis issues").clicked() { self.group_filter = group.clone(); }
+                                    } else { ui.weak("No supported analysis candidate"); }
+                                });
+                            }
+                        });
+                    });
+                    if !self.scan_summary.is_empty() { ui.label(&self.scan_summary); }
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy Summary").clicked() {
+                            ui.ctx().copy_text(self.diagnostic_report(false));
+                            self.status="Diagnostic summary copied to clipboard.".into();
+                        }
+                        if ui.button("Export Diagnostic Report").clicked() {
+                            self.export_diagnostic_report();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(self.writable && self.scan_events.is_none(), egui::Button::new("Publish index into archive")).clicked() { self.publish(); }
+                        if ui.button("Generate README.html").clicked() { self.export_readme(); }
+                    });
+                    ui.separator();
+                    ui.heading("Evidence");
+                    if let Some(db) = &self.db {
+                        let counts = db.query_row("SELECT (SELECT COUNT(*) FROM symlink_findings), (SELECT COUNT(*) FROM notebook_observations), (SELECT COUNT(*) FROM notebook_candidates)",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)));
+                        if let Ok((symlinks,observations,candidates))=counts {
+                            ui.label(format!("Symlinks: {symlinks} | Saved notebook output paths: {observations} | Cross-notebook candidates: {candidates}"));
+                        }
+                        ui.collapsing("Symlink integrity",|ui| {
+                            if let Ok(mut stmt)=db.prepare("SELECT path,target,category FROM symlink_findings ORDER BY category,path LIMIT 500") {
+                                if let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))) {
+                                    for row in rows.flatten() { ui.monospace(format!("{}: {} -> {}",row.2,row.0,row.1)); }
+                                }
+                            }
+                        });
+                        ui.collapsing("Notebook execution evidence (observed / inferred)",|ui| {
+                            if let Ok(mut stmt)=db.prepare("SELECT notebook,cell,expression,observed_path FROM notebook_observations ORDER BY notebook,cell LIMIT 300") {
+                                if let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))) {
+                                    for row in rows.flatten() { ui.monospace(format!("Observed {} cell {} [{}] => {}",row.0,row.1,row.2,row.3)); }
+                                }
+                            }
+                            if let Ok(mut stmt)=db.prepare("SELECT notebook,cell,expression,candidate_path,source_notebook,source_cell FROM notebook_candidates LIMIT 300") {
+                                if let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?))) {
+                                    for row in rows.flatten() { ui.monospace(format!("Candidate {} cell {} [{}] => {} (from {} cell {})",row.0,row.1,row.2,row.3,row.4,row.5)); }
+                                }
+                            }
+                        });
+                    }
+                    ui.label("One row per dependency. Select a file to inspect its evidence and resolve every matching occurrence.");
+                    ui.horizontal_wrapped(|ui| {
+                        for category in ["all", "external", "unresolved", "ambiguous", "resolved"] {
+                            let n = self.issues.iter().filter(|i| {
+                                if category == "resolved" { i.decision != "open" }
+                                else if category == "all" { i.decision == "open" }
+                                else { i.category == category && i.decision == "open" }
+                            }).map(|i| (i.category.as_str(), i.filename.as_str()))
+                              .collect::<HashSet<_>>().len();
+                            if ui.selectable_label(self.issue_filter == category, format!("{category} ({n})")).clicked() {
+                                self.issue_filter = category.into();
+                                self.active_dependency = None;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if let Some((category, filename)) = self.active_dependency.clone() {
+                        if ui.button("← Back to evidence").clicked() { self.active_dependency = None; }
+                        ui.heading(&filename);
+                        ui.label(format!("Category: {category}"));
+                        if let Some(issue) = self.issues.iter().find(|i| i.category == category && i.filename == filename) {
+                            let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
+                            if !ranked.is_empty() {
+                                ui.collapsing("Candidate analyses (advisory)", |ui| {
+                                    for (group, score, reason) in ranked.iter().take(5) {
+                                        let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
+                                        ui.label(format!("{name} · {score}/100 · {reason}"));
+                                    }
+                                });
+                            }
+                        }
+                        let occurrences: Vec<Issue> = self.issues.iter()
+                            .filter(|i| i.category == category && i.filename == filename).cloned().collect();
+                        ui.label(format!("{} occurrences", occurrences.len()));
+                        if let Some(first) = occurrences.first() {
+                            ui.label(format!("Current decision: {}", first.decision));
+                        }
+                        ui.separator();
+                        ui.heading("Resolution");
+                        ui.label("A decision applies to every occurrence of this dependency in this category.");
+                        ui.label("Location, external URL, or handover explanation:");
+                        if let Some(url) = lookup_global_external_link(&filename) {
+                            ui.label(format!("Reusable external resource candidate: {url}"));
+                            if ui.button("Use registry URL as explanation").clicked() { self.resolution_note = url; }
+                        }
+                        ui.text_edit_multiline(&mut self.resolution_note);
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, decision) in [
+                                ("Missing", "missing"),
+                                ("Intentional external", "intentional_external"),
+                                ("False positive", "ignored"),
+                                ("Reopen", "open"),
+                            ] {
+                                if ui.add_enabled(self.writable, egui::Button::new(label)).clicked() {
+                                    let note = self.resolution_note.clone();
+                                    self.resolve_dependency(&category, &filename, decision, &note);
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.heading("Occurrences / source evidence");
+                        let root = self.root.clone();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for issue in &occurrences {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Open source").on_hover_text(&issue.notebook).clicked() {
+                                        if let Some(root) = &root {
+                                            if let Err(e) = open_indexed_file(root, &issue.notebook) {
+                                                self.status = format!("Cannot open source: {e}");
+                                            }
+                                        }
+                                    }
+                                    ui.collapsing(format!("{} · cell/line {} · {}", issue.notebook, issue.cell, issue.decision), |ui| {
+                                    if let Some(root) = &root {
+                                        let path = root.join(&issue.notebook);
+                                        if path.extension().is_some_and(|ext| ext == "ipynb") {
+                                            match std::fs::read_to_string(&path)
+                                                .ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                                                .and_then(|v| v.get("cells")?.as_array()?.get((issue.cell - 1).max(0) as usize).cloned()) {
+                                                Some(cell) => {
+                                                    let source = match cell.get("source") {
+                                                        Some(serde_json::Value::String(s)) => s.clone(),
+                                                        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+                                                        _ => String::new(),
+                                                    };
+                                                    ui.add(egui::Label::new(egui::RichText::new(source).monospace()).wrap());
+                                                }
+                                                None => { ui.label("Notebook cell unavailable."); }
+                                            }
+                                        } else {
+                                            match std::fs::read_to_string(&path) {
+                                                Ok(source) => {
+                                                    let lines: Vec<&str> = source.lines().collect();
+                                                    let line = (issue.cell - 1).max(0) as usize;
+                                                    let from = line.min(lines.len()).saturating_sub(4);
+                                                    let to = (line + 5).min(lines.len());
+                                                    for (offset, text) in lines[from..to].iter().enumerate() {
+                                                        ui.monospace(format!("{:>5}  {}", from + offset + 1, text));
+                                                    }
+                                                }
+                                                Err(_) => { ui.label("Source file unavailable."); }
+                                            }
+                                        }
+                                    }
+                                    });
+                                });
+                            }
+                        });
+                    } else {
+                        let mut groups = std::collections::BTreeMap::<(String,String),usize>::new();
+                        for issue in &self.issues {
+                            let show = match self.issue_filter.as_str() {
+                                "resolved" => issue.decision != "open",
+                                "all" => issue.decision == "open",
+                                category => issue.category == category && issue.decision == "open",
+                            };
+                            if show && (self.group_filter.is_empty() || self.analysis_assignment.get(&issue.notebook)==Some(&self.group_filter)) { *groups.entry((issue.category.clone(),issue.filename.clone())).or_default() += 1; }
+                        }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for ((category, filename), count) in groups {
+                                if ui.selectable_label(false, format!("{filename} ({count})  ·  {category}")).clicked() {
+                                    self.resolution_note = self.issues.iter()
+                                        .find(|i| i.category == category && i.filename == filename)
+                                        .map(|i| i.note.clone()).unwrap_or_default();
+                                    self.active_dependency = Some((category,filename));
+                                }
+                            }
+                        });
+                    }
+                    ui.label("Default scan excludes all dot-folders, dot-files and generated work/ directories.");
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(self.writable && self.scan_events.is_none(), egui::Button::new("Re-scan archive")).clicked() {
+                            self.begin_scan();
+                        }
+                        if let Some(db) = &self.db {
+                            let previous = db.query_row(
+                                "SELECT files, steps, links FROM scans WHERE completed=1 ORDER BY id DESC LIMIT 1",
+                                [],
+                                |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?)),
+                            );
+                            match previous {
+                                Ok((files, steps, links)) => {
+                                    ui.label(format!("Last successful scan: {files} files, {steps} steps, {links} references"));
+                                }
+                                Err(_) => { ui.label("No successful scan recorded yet"); }
+                            }
+                        }
+                    });
+                    if self.scan_events.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner(); ui.label("Scanning in background...");
+                            if ui.button("Cancel scan").clicked() {
+                                if let Some(cancel) = &self.scan_cancel { cancel.store(true, Ordering::Relaxed); }
+                                self.scan_summary = "Cancellation requested; waiting for current filesystem operation...".into();
+                            }
+                        });
+                    }
+                    ui.separator(); ui.heading("Add a confirmed relationship");
+                    ui.label("Source path (relative to archive)"); ui.text_edit_singleline(&mut self.from);
+                    ui.label("Target path (relative to archive)"); ui.text_edit_singleline(&mut self.to);
+                    ui.label("Relationship type (e.g. reads, writes, derived_from)"); ui.text_edit_singleline(&mut self.relation_kind);
+                    ui.label("Evidence / note"); ui.text_edit_singleline(&mut self.note);
+                    if ui.add_enabled(self.writable && !self.from.trim().is_empty() && !self.to.trim().is_empty(),egui::Button::new("Save relationship")).clicked() { self.add_manual(); }
+                    ui.separator(); ui.label("Manual relationships survive rescanning. Automatic notebook references are refreshed.");
+                }
+            }
+        });
+        let after = NavState { tab: self.tab, selected: self.selected };
+        if !history_navigation && after != before && self.db.is_some() {
+            self.nav_history.truncate(self.nav_cursor + 1);
+            self.nav_history.push(after);
+            self.nav_cursor = self.nav_history.len() - 1;
+        }
+    }
+}
+// Shared scanner entry point for the headless batch executable. The GUI and CLI
+// intentionally use the exact same schema, parser and scanner implementation.

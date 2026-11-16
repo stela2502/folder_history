@@ -1,7 +1,4 @@
-// Keep one implementation of scanning: this binary imports the same core as
-// the GUI. A future library extraction can replace this module inclusion.
-#[path = "../main.rs"]
-mod folder_history;
+use folder_history::core::batch_scan_folder;
 
 use std::path::PathBuf;
 
@@ -45,7 +42,7 @@ fn run() -> anyhow::Result<()> {
     let mut failed = 0usize;
     for (i, folder) in folders.iter().enumerate() {
         println!("\n[{}/{}] {}", i+1, folders.len(), folder.display());
-        match folder_history::batch_scan_folder(folder, rescan) {
+        match batch_scan_folder(folder, rescan) {
             Ok(message) => println!("{message}"),
             Err(error) => { failed+=1; eprintln!("ERROR {}: {error:#}", folder.display()); },
         }
