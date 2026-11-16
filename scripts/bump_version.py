@@ -28,13 +28,18 @@ def current_version() -> str:
     return match.group(1)
 
 
-def clean_tree() -> None:
-    if output("git", "status", "--porcelain"):
-        raise RuntimeError("Working tree is dirty; commit or stash changes first")
+def check_version_files_clean() -> None:
+    # Unrelated work is allowed during a version bump. Never overwrite
+    # existing edits to either version file, including staged changes.
+    changes = output("git", "status", "--porcelain", "--", "Cargo.toml", "Cargo.lock")
+    if changes:
+        raise RuntimeError(
+            "Version files already modified; inspect them before bumping:\n" + changes
+        )
 
 
 def bump(kind: str) -> None:
-    clean_tree()
+    check_version_files_clean()
     old = current_version()
     major, minor, patch = map(int, old.split("."))
     if kind == "major":
