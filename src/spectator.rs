@@ -248,7 +248,33 @@ impl App {
                         ui.colored_label(egui::Color32::GRAY, "● references");
                     });
                     ui.separator();
-                    ui.label(format!("{} detected groups · {} indexed files", self.analysis_groups.len(), self.artifacts.len()));
+                    // Scientist confirmations are authoritative annotations, not guesses
+                    // from filename extensions. Keep source and path together: a relative
+                    // filename in one notebook must not annotate a namesake elsewhere.
+                    let confirmed: Vec<(String, String, String)> = self.db.as_ref()
+                        .and_then(|db| {
+                            let mut stmt = db.prepare("SELECT source,path,role FROM file_classifications WHERE confirmed=1 ORDER BY source,path").ok()?;
+                            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()?;
+                            Some(rows.flatten().collect())
+                        }).unwrap_or_default();
+                    ui.label(format!("{} detected groups · {} indexed files · {} confirmed classifications",
+                        self.analysis_groups.len(), self.artifacts.len(), confirmed.len()));
+                    if !confirmed.is_empty() {
+                        ui.collapsing(format!("✓ Scientist-confirmed files and folders ({})", confirmed.len()), |ui| {
+                            egui::Grid::new("confirmed_classifications_overview").striped(true).show(ui, |ui| {
+                                ui.strong("File / folder"); ui.strong("Classification"); ui.strong("Source script"); ui.end_row();
+                                for (source, path, role) in &confirmed {
+                                    ui.label(path).on_hover_text(path);
+                                    ui.strong(role);
+                                    ui.small(source);
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                    // The authoritative role table is shared with the scanner and wizard.
+                    let confirmed_by_path = self.db.as_ref()
+                        .and_then(|db| engine::confirmed_roles(db).ok()).unwrap_or_default();
                     let mut pending_file_actions: Vec<(String, Option<i64>, FileAction)> = Vec::new();
                     let by_path: HashMap<&str, &Artifact> = self.artifacts.iter().map(|a| (a.path.as_str(), a)).collect();
                     let links = &self.relations;
@@ -334,8 +360,19 @@ impl App {
                                                                 }
                                                                 for path in &paths {
                                                                     let Some(a) = by_path.get(path) else { continue; };
-                                                                    let (color, _role) = file_role(&a.path, &a.kind, links);
+                                                                    let (mut color, _role) = file_role(&a.path, &a.kind, links);
+                                                                    if let Some(role) = confirmed_by_path.get(a.path.as_str()) {
+                                                                        color = match role.as_str() {
+                                                                            "Input data" | "Intermediate raw data" => egui::Color32::from_rgb(100,175,255),
+                                                                            "Preprocessed data" | "Quantification results" => egui::Color32::from_rgb(80,145,215),
+                                                                            "Analyzed data" | "Results folder" => egui::Color32::from_rgb(245,105,105),
+                                                                            _ => color,
+                                                                        };
+                                                                    }
                                                                     let basename = a.path.rsplit('/').next().unwrap_or(&a.path);
+                                                                    if let Some(role) = confirmed_by_path.get(a.path.as_str()) {
+                                                                        ui.strong(format!("✓ {role}"));
+                                                                    }
                                                                     if let Some(action) = file::show(ui, basename, &a.path, self.selected == Some(a.id), Some(color)) {
                                                                         pending_file_actions.push((a.path.clone(), Some(a.id), action));
                                                                     }

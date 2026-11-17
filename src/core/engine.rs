@@ -27,6 +27,33 @@ pub fn schema(db: &Connection) -> Result<()> {
             files INTEGER NOT NULL DEFAULT 0, steps INTEGER NOT NULL DEFAULT 0,
             links INTEGER NOT NULL DEFAULT 0);
         PRAGMA user_version=2;")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS file_classifications (
+        source TEXT NOT NULL, path TEXT NOT NULL, role TEXT NOT NULL,
+        confirmed INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY(source,path)
+    );")?;
+    // Canonical scientist-confirmed roles, shared by the wizard, scanner and UI.
+    // Source-scoped legacy evidence is retained in file_classifications.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS artifact_roles (
+        path TEXT PRIMARY KEY, role TEXT NOT NULL, source TEXT NOT NULL,
+        confirmed INTEGER NOT NULL DEFAULT 1
+    );")?;
+    // Upgrade confirmations saved by earlier wizard versions. Resolve only
+    // unambiguous paths, never invent a match for duplicate basenames.
+    {
+        let paths: HashSet<String> = db.prepare("SELECT path FROM artifacts")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut q = db.prepare("SELECT source,path,role FROM file_classifications WHERE confirmed=1 ORDER BY rowid")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (source, reference, role) in rows {
+            if let Some(path) = classified_artifact_path(&reference, &source, &paths) {
+                db.execute("INSERT OR IGNORE INTO artifact_roles(path,role,source,confirmed) VALUES (?1,?2,?3,1)",
+                    params![path,role,source])?;
+            }
+        }
+    }
     // Existing v2 indexes are upgraded in place without discarding manual links.
     let has_created: bool = db.prepare("PRAGMA table_info(artifacts)")?
         .query_map([], |r| r.get::<_,String>(1))?
@@ -53,6 +80,28 @@ pub fn schema(db: &Connection) -> Result<()> {
         PRIMARY KEY(source,target,reason));")?;
     Ok(())
 }
+/// Resolve a source-relative reference to an inventory path. Never guess between
+/// multiple same-named files; a non-existing path is not an indexed artifact.
+pub fn classified_artifact_path(reference: &str, source: &str, paths: &HashSet<String>) -> Option<String> {
+    let reference = safe_relative(reference)?;
+    if paths.contains(&reference) { return Some(reference); }
+    let parent = std::path::Path::new(source).parent().unwrap_or_else(|| std::path::Path::new(""));
+    let local = safe_relative(&normalized(&parent.join(&reference)))?;
+    if paths.contains(&local) { return Some(local); }
+    let name = reference.rsplit('/').next()?;
+    let mut matches = paths.iter().filter(|p| p.rsplit('/').next() == Some(name));
+    let only = matches.next()?.clone();
+    if matches.next().is_some() { None } else { Some(only) }
+}
+
+/// Authoritative roles are intentionally not provenance edges: a stage label
+/// cannot prove which input produced an output.
+pub fn confirmed_roles(db: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = db.prepare("SELECT path,role FROM artifact_roles WHERE confirmed=1")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>().map_err(Into::into)
+}
+
 pub fn kind(path: &Path) -> &'static str {
     let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
     if name.ends_with(".ipynb") { "notebook" }
@@ -451,7 +500,16 @@ pub fn scan(db: &mut Connection, root: &Path, hidden: bool, cancel: &AtomicBool,
             }
         }
     }
+    let file_paths: HashSet<&str> = files.iter().map(|f| f.0.as_str()).collect();
     let tx = db.transaction()?;
+    // Directory roles must be first-class artifacts too. No synthetic
+    // producer/consumer edges are created for directories.
+    for path in &paths {
+        if !file_paths.contains(path.as_str()) {
+            tx.execute("INSERT INTO artifacts(path,kind) VALUES (?1,'directory')
+                ON CONFLICT(path) DO UPDATE SET kind='directory'", params![path])?;
+        }
+    }
     for (path, kind, size, modified, created) in &files {
         if cancel.load(Ordering::Relaxed) { anyhow::bail!("Scan cancelled"); }
         tx.execute("INSERT INTO artifacts(path,kind,size,modified,created) VALUES (?1,?2,?3,?4,?5)
@@ -542,39 +600,6 @@ pub fn local_index_path(root: &Path) -> PathBuf {
     root.join(".folder_history").join("history.sqlite")
 }
 
-// Previous releases used a machine-local hashed index. Import it only when the
-// portable index is absent; never overwrite a researcher's existing history.
-pub fn legacy_index_path(root: &Path) -> PathBuf {
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in normalized(&canonical).as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("FolderHistory").join(format!("{hash:016x}")).join("folder-history.sqlite")
-}
-
-pub fn import_existing_index(root: &Path, dest: &Path) -> Result<()> {
-    if dest.exists() { return Ok(()); }
-    let previous_archive = root.join(".folder-history/history.sqlite");
-    let legacy = legacy_index_path(root);
-    let source = [previous_archive, legacy].into_iter().find(|p| p.is_file());
-    if let Some(source) = source {
-        if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
-        // SQLite's VACUUM INTO creates a consistent snapshot even if the source
-        // database uses WAL. Never modify or remove the original index.
-        let old = Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let destination = dest.to_string_lossy().replace('\'', "''");
-        old.execute_batch(&format!("VACUUM INTO '{destination}'"))
-            .with_context(|| format!("Importing {} into {}", source.display(), dest.display()))?;
-    }
-    Ok(())
-}
-
 pub fn report_safe(value: &str) -> String {
     // Only archive-relative paths or basenames are allowed in shared diagnostics.
     // Reject path-like tokens with absolute roots, Windows drives, or parent traversal.
@@ -597,9 +622,9 @@ pub fn batch_finished_path(db_path: &Path) -> PathBuf {
 
 // Keep SQLite transactions off SMB/CIFS shares. The archive only receives a
 // closed, verified database snapshot; each worker owns a separate local folder.
-struct BatchWorkspace(PathBuf);
+pub struct BatchWorkspace(PathBuf);
 impl BatchWorkspace {
-    fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let base = std::env::var_os("TMPDIR").map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         for attempt in 0..1000u32 {
@@ -622,6 +647,75 @@ impl Drop for BatchWorkspace {
     }
 }
 
+// A real write probe is more reliable than permission bits on SMB mounts.
+pub fn probe_archive_write_access(root: &Path) -> Result<()> {
+    let target = root.join(".folder_history");
+    let dir = if target.is_dir() { target.as_path() } else { root };
+    let name = format!(".folderhistory-write-test-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
+    let path = dir.join(name);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
+        .with_context(|| format!("Archive is not writable: {}", dir.display()))?;
+    use std::io::Write;
+    let write_result = file.write_all(b"FolderHistory write probe\n");
+    drop(file);
+    let remove_result = std::fs::remove_file(&path);
+    write_result?;
+    remove_result?;
+    Ok(())
+}
+
+// Copy only the canonical archive index into a local workspace. Never use
+// SQLite on the archive path, and never import a legacy database.
+// A missing archive is a new index, not a migration request.
+pub fn archive_working_copy(root: &Path) -> Result<(BatchWorkspace, PathBuf, PathBuf, bool)> {
+    let archive = local_index_path(root);
+    let workspace = BatchWorkspace::new()?;
+    let local = workspace.0.join("history.sqlite");
+    let exists = archive.is_file();
+    if exists {
+        // A raw copy is safe only for a closed, single-file SQLite database.
+        // A sidecar is not necessarily a lock: report exactly what we found.
+        ensure_no_sqlite_sidecars(&archive)?;
+        std::fs::copy(&archive, &local)
+            .with_context(|| format!("Copying archive index {} to local workspace", archive.display()))?;
+    }
+    Ok((workspace, local, archive, exists))
+}
+
+fn ensure_no_sqlite_sidecars(database: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = std::ffi::OsString::from(format!("{}{}", database.display(), suffix));
+        let path = PathBuf::from(sidecar);
+        if path.exists() {
+            anyhow::bail!("SQLite sidecar exists at {}. Cannot safely copy the database as a single file; this does not necessarily mean it is locked.", path.display());
+        }
+    }
+    Ok(())
+}
+
+// Publish a closed, consistent local SQLite snapshot. Both CLI and GUI use this.
+pub fn publish_archive_snapshot(local: &Path, archive: &Path) -> Result<()> {
+    let parent = archive.parent().context("Archive database has no parent directory")?;
+    // Publication must use a closed, standalone SQLite file.
+    ensure_no_sqlite_sidecars(local)?;
+    if archive.exists() { ensure_no_sqlite_sidecars(archive)?; }
+    std::fs::create_dir_all(parent)?;
+    let staging = archive.with_extension(format!("sqlite.publish-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+    let result = (|| -> Result<()> {
+        std::fs::copy(local, &staging)
+            .with_context(|| format!("Copying SQLite snapshot into {}", staging.display()))?;
+        // Do not replace an existing database with a partial transfer.
+        std::fs::rename(&staging, archive)
+            .with_context(|| format!("Replacing archive SQLite {}", archive.display()))?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&staging); }
+    result
+}
+
 pub fn batch_scan_folder(root: &Path, rescan: bool) -> Result<String> {
     if !root.is_dir() { anyhow::bail!("Not a directory: {}", root.display()); }
     let root = root.canonicalize()?;
@@ -632,23 +726,7 @@ pub fn batch_scan_folder(root: &Path, rescan: bool) -> Result<String> {
     }
     if let Some(parent) = db_path.parent() { std::fs::create_dir_all(parent)?; }
 
-    let workspace = BatchWorkspace::new()?;
-    let local_db = workspace.0.join("history.sqlite");
-    if db_path.is_file() {
-        // A raw copy is only safe for a quiescent, rollback-journal database.
-        // Refuse to ignore pending journal/WAL data.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
-            if sidecar.exists() {
-                anyhow::bail!("Cannot safely copy SQLite database with sidecar {}. Close other SQLite clients first.", sidecar.display());
-            }
-        }
-        std::fs::copy(&db_path, &local_db)
-            .with_context(|| format!("Copying {} into local workspace", db_path.display()))?;
-    } else {
-        // Legacy migration must also execute locally, never on the SMB share.
-        import_existing_index(&root, &local_db)?;
-    }
+    let (_workspace, local_db, _, _) = archive_working_copy(&root)?;
 
     let mut db = Connection::open(&local_db)
         .with_context(|| format!("Opening local SQLite {}", local_db.display()))?;
@@ -667,30 +745,17 @@ pub fn batch_scan_folder(root: &Path, rescan: bool) -> Result<String> {
 
     // Copy into the destination directory first. The existing archive database
     // remains intact if the scan or transfer fails.
-    let staging = db_path.with_extension(format!("sqlite.publish-{}", std::process::id()));
-    if staging.exists() {
-        anyhow::bail!("Publication staging file already exists: {}", staging.display());
-    }
-    let publication = (|| -> Result<()> {
-        std::fs::copy(&local_db, &staging)
-            .with_context(|| format!("Publishing local SQLite to {}", staging.display()))?;
-        // Never leave a valid completion marker pointing at an in-progress
-        // replacement. A failed publication remains eligible for rescan.
-        if finished.exists() { std::fs::remove_file(&finished)?; }
-        std::fs::rename(&staging, &db_path)
-            .with_context(|| format!("Replacing archive SQLite {}", db_path.display()))?;
-        let marker = format!("schema_version=1\ncompleted_unix={}\nfiles={}\nsteps={}\nlinks={}\n",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
-            result.files, result.steps, result.links);
-        let temporary = finished.with_extension(format!("sqlite.finished.tmp-{}", std::process::id()));
-        std::fs::write(&temporary, marker)?;
-        let marker_result = std::fs::rename(&temporary, &finished);
-        if marker_result.is_err() { let _ = std::fs::remove_file(&temporary); }
-        marker_result?;
-        Ok(())
-    })();
-    if publication.is_err() { let _ = std::fs::remove_file(&staging); }
-    publication?;
+    // Invalidate the old completion marker before replacing the archive.
+    if finished.exists() { std::fs::remove_file(&finished)?; }
+    publish_archive_snapshot(&local_db, &db_path)?;
+    let marker = format!("schema_version=1\ncompleted_unix={}\nfiles={}\nsteps={}\nlinks={}\n",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        result.files, result.steps, result.links);
+    let temporary = finished.with_extension(format!("sqlite.finished.tmp-{}", std::process::id()));
+    std::fs::write(&temporary, marker)?;
+    let marker_result = std::fs::rename(&temporary, &finished);
+    if marker_result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    marker_result?;
     Ok(format!("OK files={} scripts={} parsed={} links={} warnings={} elapsed={:.1}s index={}",
         result.files, result.scripts, result.parsed, result.links,
         result.warnings, started.elapsed().as_secs_f64(), db_path.display()))
@@ -699,6 +764,32 @@ pub fn batch_scan_folder(root: &Path, rescan: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_index_round_trip_ignores_legacy() {
+        let scratch = BatchWorkspace::new().unwrap();
+        let root = scratch.0.join("research");
+        std::fs::create_dir_all(root.join(".folder-history")).unwrap();
+        std::fs::write(root.join(".folder-history/history.sqlite"), b"legacy ignored").unwrap();
+        let (workspace, local, archive, exists) = archive_working_copy(&root).unwrap();
+        assert!(!exists);
+        assert!(!local.exists());
+        {
+            let db = Connection::open(&local).unwrap();
+            schema(&db).unwrap();
+            db.execute("INSERT INTO artifacts(path,kind) VALUES ('input.fastq','fastq')", []).unwrap();
+            db.close().unwrap();
+        }
+        publish_archive_snapshot(&local, &archive).unwrap();
+        drop(workspace);
+        let (workspace, copied, _, exists) = archive_working_copy(&root).unwrap();
+        assert!(exists);
+        let db = Connection::open_with_flags(&copied, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        db.close().unwrap();
+        drop(workspace);
+    }
 
     fn scientific_mess() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -874,5 +965,25 @@ mod tests {
     fn relative_paths_do_not_escape() {
         assert_eq!(safe_relative("../x"),None);
         assert_eq!(safe_relative("a/../b"),Some("b".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod classification_integration_tests {
+    use super::*;
+    #[test]
+    fn unique_and_ambiguous_paths() {
+        let paths: HashSet<String> = ["a/data.h5ad", "b/data.h5ad", "a/quant_res"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(classified_artifact_path("data.h5ad", "a/script.ipynb", &paths).as_deref(), Some("a/data.h5ad"));
+        assert_eq!(classified_artifact_path("data.h5ad", "other/script.ipynb", &paths), None);
+        assert_eq!(classified_artifact_path("quant_res", "a/script.ipynb", &paths).as_deref(), Some("a/quant_res"));
+    }
+    #[test]
+    fn confirmed_roles_survive_schema_and_are_authoritative() {
+        let db = Connection::open_in_memory().unwrap();
+        schema(&db).unwrap();
+        db.execute("INSERT INTO artifact_roles(path,role,source) VALUES ('a/quant_res','Quantification results','a/script.ipynb')", []).unwrap();
+        schema(&db).unwrap();
+        assert_eq!(confirmed_roles(&db).unwrap().get("a/quant_res").map(String::as_str), Some("Quantification results"));
     }
 }

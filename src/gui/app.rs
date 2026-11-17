@@ -90,29 +90,30 @@ pub(crate) fn issue_analysis_candidates(
     ranked
 }
 
+
 pub(crate) enum ScanEvent { Progress(String), Finished(Result<ScanResult, String>), Resolved(Result<(i64, i64), String>) }
 
 pub(crate) struct App {
-    pub(crate) root: Option<PathBuf>, pub(crate) db: Option<Connection>, pub(crate) writable: bool, pub(crate) index_path: Option<PathBuf>,
+    pub(crate) root: Option<PathBuf>, local_workspace: Option<BatchWorkspace>, pub(crate) db: Option<Connection>, pub(crate) index_path: Option<PathBuf>,
     pub(crate) tab: Tab, pub(crate) query: String, pub(crate) artifacts: Vec<Artifact>, pub(crate) relations: Vec<Relation>,
     pub(crate) selected: Option<i64>, pub(crate) status: String, pub(crate) from: String, pub(crate) to: String,
-    pub(crate) relation_kind: String, pub(crate) note: String, pub(crate) show_all: bool, pub(crate) issues: Vec<Issue>, pub(crate) issue_filter: String, pub(crate) active_dependency: Option<(String,String)>, pub(crate) resolution_note: String, pub(crate) scan_summary: String,
+    pub(crate) relation_kind: String, pub(crate) note: String, pub(crate) show_all: bool, pub(crate) issues: Vec<Issue>, pub(crate) issue_filter: String, pub(crate) active_dependency: Option<(String,String)>, pub(crate) resolution_note: String, pub(super) wizard_index: usize, pub(super) wizard_mode: bool, pub(super) classification_choices: HashMap<String, String>, pub(super) classification_selected: HashMap<String, bool>, pub(super) recently_confirmed: Option<(String, String)>, pub(crate) scan_summary: String,
     pub(crate) group_filter: String, pub(crate) group_names: HashMap<String, String>, pub(crate) group_name_edit: String,
     pub(crate) analysis_groups: Vec<analysis_graph::AnalysisGroup>, pub(crate) analysis_assignment: HashMap<String, String>,
     pub(crate) nav_history: Vec<NavState>, pub(crate) nav_cursor: usize,
-    pub(crate) recent_folders: Vec<PathBuf>, pub(crate) include_hidden: bool, pub(crate) scan_events: Option<Receiver<ScanEvent>>, pub(crate) scan_cancel: Option<Arc<AtomicBool>>,
+    pub(crate) recent_folders: Vec<PathBuf>, pub(crate) include_hidden: bool, missing_index: Option<PathBuf>, error_popup: Option<String>, pub(crate) open_events: Option<Receiver<App>>, pub(crate) scan_after_open: bool, pub(crate) scan_events: Option<Receiver<ScanEvent>>, pub(crate) scan_cancel: Option<Arc<AtomicBool>>,
 }
 impl Default for App {
     fn default() -> Self {
-        Self { root: None, db: None, writable: false, index_path: None, tab: Tab::Search,
+        Self { root: None, local_workspace: None, db: None, index_path: None, tab: Tab::Search,
             query: String::new(), artifacts: vec![], relations: vec![], selected: None,
             status: "Open a research folder to begin.".into(), from: String::new(),
             to: String::new(), relation_kind: "derived_from".into(), note: String::new(),
-            show_all: false, issues: vec![], issue_filter: "all".into(), active_dependency: None, resolution_note: String::new(), scan_summary: String::new(),
+            show_all: false, issues: vec![], issue_filter: "all".into(), active_dependency: None, resolution_note: String::new(), wizard_index: 0, wizard_mode: false, classification_choices: HashMap::new(), classification_selected: HashMap::new(), recently_confirmed: None, scan_summary: String::new(),
             group_filter: String::new(), group_names: HashMap::new(), group_name_edit: String::new(),
             analysis_groups: Vec::new(), analysis_assignment: HashMap::new(),
             nav_history: vec![], nav_cursor: 0,
-            recent_folders: load_recent_folders(), include_hidden: false, scan_events: None, scan_cancel: None }
+            recent_folders: load_recent_folders(), include_hidden: false, missing_index: None, error_popup: None, open_events: None, scan_after_open: false, scan_events: None, scan_cancel: None }
     }
 }
 
@@ -141,46 +142,94 @@ pub(crate) fn save_recent_folders(folders: &[PathBuf]) -> Result<()> {
 
 impl App {
     pub(crate) fn open(&mut self, root: PathBuf, analyze: bool) {
-        let path = local_index_path(&root);
-        let result: Result<Connection> = (|| {
-            if !root.is_dir() { anyhow::bail!("Folder does not exist: {}", root.display()); }
-            if analyze {
-                import_existing_index(&root, &path)?;
-                if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-            } else if !path.is_file() {
-                // Read the old portable index directly in Spectator mode. Importing
-                // is a separate, explicit Build operation and must not be required
-                // merely to browse an archive.
-                let old = root.join(".folder-history/history.sqlite");
-                if !old.is_file() {
-                    anyhow::bail!("No FolderHistory database found in .folder_history or .folder-history");
-                }
+        if self.open_events.is_some() || self.scan_events.is_some() { return; }
+        let (tx, rx) = mpsc::channel();
+        self.open_events = Some(rx);
+        self.missing_index = None;
+        self.scan_after_open = analyze;
+        self.status = format!("Loading archive {}…", root.display());
+        std::thread::spawn(move || {
+            // SQLite reads and analysis-group construction must never block egui.
+            let mut loaded = App::default();
+            loaded.open_sync(root, analyze);
+            let _ = tx.send(loaded);
+        });
+    }
+
+    fn poll_open(&mut self) {
+        let result = self.open_events.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(mut loaded) = result {
+            self.open_events = None;
+            if loaded.db.is_none() {
+                self.missing_index = loaded.missing_index.take();
+                self.scan_after_open = false;
+                self.status = loaded.status;
+                if self.missing_index.is_none() { self.error_popup = Some(self.status.clone()); }
+                return;
             }
-            let open_path = if !analyze && !path.is_file() {
-                root.join(".folder-history/history.sqlite")
-            } else { path.clone() };
-            let flags = if analyze {
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
-            } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
-            let db = Connection::open_with_flags(&open_path, flags)
-                .with_context(|| format!("Opening {}", open_path.display()))?;
-            if analyze { schema(&db)?; }
-            Ok(db)
+            self.db = None; // Release any previous archive connection before its workspace.
+            self.local_workspace = loaded.local_workspace.take();
+            self.root = loaded.root.take();
+            self.db = loaded.db.take();
+            self.index_path = loaded.index_path.take();
+            self.tab = loaded.tab;
+            self.artifacts = std::mem::take(&mut loaded.artifacts);
+            self.relations = std::mem::take(&mut loaded.relations);
+            self.issues = std::mem::take(&mut loaded.issues);
+            self.group_names = std::mem::take(&mut loaded.group_names);
+            self.analysis_groups = std::mem::take(&mut loaded.analysis_groups);
+            self.analysis_assignment = std::mem::take(&mut loaded.analysis_assignment);
+            self.recent_folders = std::mem::take(&mut loaded.recent_folders);
+            self.nav_history.clear();
+            self.nav_cursor = 0;
+            self.selected = None;
+            self.active_dependency = None;
+            self.group_filter.clear();
+            self.status = loaded.status;
+            if self.scan_after_open {
+                self.scan_after_open = false;
+                self.tab = Tab::Build;
+                self.begin_scan();
+            }
+        } else if self.open_events.as_ref().is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))) {
+            self.open_events = None;
+            self.scan_after_open = false;
+            self.status = "Archive opening failed: background worker disconnected".into();
+        }
+    }
+
+    fn open_sync(&mut self, root: PathBuf, analyze: bool) {
+        let result: Result<(Connection, BatchWorkspace, PathBuf, PathBuf)> = (|| {
+            if !root.is_dir() { anyhow::bail!("Folder does not exist: {}", root.display()); }
+            if analyze { probe_archive_write_access(&root)?; }
+            let (workspace, local, archive, exists) = archive_working_copy(&root)?;
+            if !exists && !analyze {
+                self.missing_index = Some(root.clone());
+                anyhow::bail!("No FolderHistory database found in .folder_history/history.sqlite");
+            }
+            // Both entry points use an editable local SQLite working copy.
+            // Tabs select a workflow, not a permission level.
+            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+            let db = Connection::open_with_flags(&local, flags)
+                .with_context(|| format!("Opening local SQLite {}", local.display()))?;
+            db.busy_timeout(std::time::Duration::from_secs(30))?;
+            db.execute_batch("PRAGMA journal_mode=DELETE;")?;
+            schema(&db)?;
+            Ok((db, workspace, local, archive))
         })();
         match result {
-            Ok(db) => {
+            Ok((db, workspace, local, archive)) => {
                 self.recent_folders.retain(|p| p != &root);
                 self.recent_folders.insert(0, root.clone());
                 self.recent_folders.truncate(5);
                 let recent_save_error = save_recent_folders(&self.recent_folders).err();
                 self.nav_history.clear(); self.nav_cursor = 0;
-                self.root = Some(root); self.db = Some(db); self.writable = analyze;
-                self.index_path = Some(if !analyze && !path.is_file() {
-                    self.root.as_ref().unwrap().join(".folder-history/history.sqlite")
-                } else { path.clone() });
+                self.root = Some(root); self.db = Some(db);
+                self.local_workspace = Some(workspace);
+                self.index_path = Some(local);
                 self.selected = None; self.active_dependency = None; self.group_filter.clear();
                 self.tab = if analyze { Tab::Build } else { Tab::Spectator };
-                self.refresh(); self.status = format!("Opened index {}", self.index_path.as_ref().unwrap().display());
+                self.refresh(); self.status = format!("Opened local copy of {}", archive.display());
                 if let Some(e) = recent_save_error {
                     self.status.push_str(&format!(" (could not save recent folders: {e})"));
                 }
@@ -221,7 +270,7 @@ impl App {
         self.artifacts.iter().find(|a| Some(a.id)==self.selected).map(|a| a.path.clone())
     }
     pub(crate) fn add_manual(&mut self) {
-        if !self.writable { return; }
+        
         if let Some(db) = &self.db {
             if !self.artifacts.iter().any(|a| a.path == self.from.trim()) || !self.artifacts.iter().any(|a| a.path == self.to.trim()) { self.status="Both paths must be indexed files inside this archive.".into(); return; }
             match add_relation(db, self.from.trim(), self.to.trim(), self.relation_kind.trim(), self.note.trim(), true) {
@@ -230,10 +279,38 @@ impl App {
             }
         }
     }
+    // Save a classification only for the equivalent source references shown in
+    // the wizard. Do not silently classify other calls using the same filename.
+    pub(super) fn resolve_issue_group(&mut self, ids: &[i64], decision: &str, note: &str) {
+        
+        if decision == "ignore" && note.trim().is_empty() {
+            self.status = "Ignoring a reference requires an explanation.".into();
+            return;
+        }
+        let Some(db) = &mut self.db else { return; };
+        let result: Result<()> = (|| {
+            let tx = db.transaction()?;
+            for id in ids {
+                tx.execute("UPDATE issues SET decision=?1,note=?2 WHERE id=?3",
+                    params![decision, note, id])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.refresh();
+                self.publish();
+                self.status = format!("Saved {decision} for {} source occurrence(s).", ids.len());
+            }
+            Err(e) => self.status = format!("Cannot save classification: {e:#}"),
+        }
+    }
+
     // A resolution belongs to the dependency, not to an individual notebook cell.
     // The existing issue table remains the source of occurrence-level evidence.
     pub(crate) fn resolve_dependency(&mut self, category: &str, filename: &str, decision: &str, note: &str) {
-        if !self.writable { return; }
+        
         let Some(db) = &mut self.db else { return; };
         let result: Result<usize> = (|| {
             let tx = db.transaction()?;
@@ -251,23 +328,33 @@ impl App {
                     }
                 }
                 self.refresh();
-                self.status = format!("Updated {changed} occurrences of {filename}; changes saved to local index.");
+                self.status = format!("Updated {changed} occurrences of {filename}.");
+                self.publish();
             }
             Err(e) => self.status = format!("Dependency resolution failed: {e:#}"),
         }
     }
     pub(crate) fn publish(&mut self) {
-        // The live database is already stored with the researcher's files.
-        // Checkpoint WAL so copying the folder needs only history.sqlite.
-        if let Some(db) = &self.db {
-            match db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                Ok(()) => self.status = "Project history already stored in .folder_history/history.sqlite".into(),
-                Err(e) => self.status = format!("Checkpoint failed: {e}"),
-            }
+        if self.scan_events.is_some() { return; }
+        let (Some(db), Some(root), Some(local)) = (&self.db, &self.root, &self.index_path) else { return; };
+        let snapshot = local.with_extension("publish-snapshot.sqlite");
+        let result: Result<()> = (|| {
+            if snapshot.exists() { std::fs::remove_file(&snapshot)?; }
+            // Snapshot locally, even while the GUI holds its local connection open.
+            let escaped = snapshot.to_string_lossy().replace('\'', "''");
+            db.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+            let archive = local_index_path(root);
+            publish_archive_snapshot(&snapshot, &archive)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&snapshot);
+        match result {
+            Ok(()) => self.status = "Published local SQLite snapshot to archive.".into(),
+            Err(e) => self.status = format!("Publication failed; local working database retained: {e:#}"),
         }
     }
     pub(crate) fn begin_scan(&mut self) {
-        if self.scan_events.is_some() || !self.writable { return; }
+        if self.scan_events.is_some() { return; }
         let (Some(root), Some(index)) = (self.root.clone(), self.index_path.clone()) else { return; };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -280,6 +367,7 @@ impl App {
         std::thread::spawn(move || {
             let result = (|| -> Result<ScanResult> {
                 let mut db = Connection::open(index)?;
+                db.busy_timeout(std::time::Duration::from_secs(30))?;
                 schema(&db)?;
                 scan(&mut db, &root, hidden, &worker_cancel, |message| {
                     let _ = tx.send(ScanEvent::Progress(message));
@@ -289,7 +377,7 @@ impl App {
         });
     }
     pub(crate) fn begin_relink(&mut self) {
-        if self.scan_events.is_some() || !self.writable { return; }
+        if self.scan_events.is_some() { return; }
         let Some(index) = self.index_path.clone() else { return; };
         let (tx, rx) = mpsc::channel();
         self.scan_events = Some(rx);
@@ -297,6 +385,8 @@ impl App {
         std::thread::spawn(move || {
             let result = (|| -> Result<(i64, i64)> {
                 let mut db = Connection::open(index)?;
+                db.busy_timeout(std::time::Duration::from_secs(30))?;
+                db.busy_timeout(std::time::Duration::from_secs(30))?;
                 schema(&db)?;
                 relink_cached_evidence(&mut db)
             })().map_err(|e| format!("{e:#}"));
@@ -324,7 +414,7 @@ impl App {
                     self.scan_summary = self.status.clone();
                     self.publish();
                 }
-                Err(e) => self.status = format!("Re-resolve failed: {e}"),
+                Err(e) => { self.status = format!("Re-resolve failed: {e}"); self.error_popup = Some(self.status.clone()); },
             }
         }
         if let Some(result) = finished {
@@ -340,6 +430,7 @@ impl App {
                 Err(e) => {
                     self.scan_summary = format!("Re-scan did not complete: {e}");
                     self.status = self.scan_summary.clone();
+                    self.error_popup = Some(self.status.clone());
                 },
             }
         }
@@ -434,24 +525,12 @@ impl App {
         }
     }
     pub(crate) fn export_readme(&mut self) {
-        let Some(root) = self.root.clone() else { return; };
-        let esc = |v: &str| v.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;");
-        let mut html = String::from("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>FolderHistory archive report</title><style>body{font:16px system-ui;max-width:1000px;margin:3em auto;padding:0 1em;background:#16191e;color:#eee}a{color:#9ccaff}article{border:1px solid #555;padding:1em;margin:1em 0;border-radius:8px}small{color:#bbb}</style><h1>Research archive — FolderHistory</h1>");
-        html.push_str(&format!("<p>{} indexed files, {} relationships, {} issues.</p>",self.artifacts.len(),self.relations.len(),self.issues.len()));
-        for category in ["external","unresolved","ambiguous"] {
-            html.push_str(&format!("<h2>{}</h2>",esc(category)));
-            for i in self.issues.iter().filter(|i| i.category == category) {
-                let href = i.notebook.split('/').map(|x| x.replace(' ',"%20")).collect::<Vec<_>>().join("/");
-                html.push_str(&format!("<article><a href=\"{}\">{}</a> — cell {}<p>Reference: <code>{}</code></p><small>Status: {} — {}</small></article>",esc(&href),esc(&i.notebook),i.cell,esc(&i.filename),esc(&i.decision),esc(&i.note)));
-            }
-        }
-        let findings = report::markdown(&root, &self.artifacts, &self.relations, &self.issues);
-        html.push_str("<h2>Archive handover findings</h2><pre style=\"white-space:pre-wrap;overflow-wrap:anywhere\">");
-        html.push_str(&esc(&findings));
-        html.push_str("</pre><p>Paths in this report are relative to the archive. External source directories are intentionally omitted.</p></html>");
-        match std::fs::File::create(root.join("README.html")).and_then(|mut f| f.write_all(html.as_bytes())) {
-            Ok(()) => self.status="Generated README.html in archive root.".into(),
-            Err(e) => self.status=format!("README export failed: {e}"),
+        let Some(root) = self.root.as_ref() else { return; };
+        match folder_history::core::documentation::generate(
+            root, &self.artifacts, &self.relations, &self.issues
+        ) {
+            Ok(outcome) => self.status = outcome.summary(),
+            Err(e) => self.status = format!("Documentation generation failed: {e:#}"),
         }
     }
 }
@@ -467,8 +546,9 @@ pub(crate) fn source_group(path: &str) -> String {
 */
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_open();
         self.poll_scan();
-        if self.scan_events.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(150)); }
+        if self.scan_events.is_some() || self.open_events.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(150)); }
         // Record user navigation once per frame; Back/Forward do not create new entries.
         let before = NavState { tab: self.tab, selected: self.selected };
         let mut history_navigation = false;
@@ -476,17 +556,29 @@ impl eframe::App for App {
         let forward_key = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight));
         let home_key = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::Home));
         ctx.set_visuals(egui::Visuals::dark());
+        // Investigation is a separate application view, not an expansion of
+        // Build / Repair. Draw it before the normal navigation and return.
+        if self.wizard_mode {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                self.draw_investigation(ui);
+            });
+            return;
+        }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("FolderHistory");
-                if ui.add_enabled(self.scan_events.is_none(), egui::Button::new("Analyze a folder")).clicked() {
+                if ui.add_enabled(self.scan_events.is_none() && self.open_events.is_none(), egui::Button::new("Analyze a folder")).clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, true); }
                 }
-                if ui.add_enabled(self.scan_events.is_none(), egui::Button::new("Open existing history")).clicked() {
+                if ui.add_enabled(self.scan_events.is_none() && self.open_events.is_none(), egui::Button::new("Open existing history")).clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, false); }
                 }
                 if self.db.is_some() {
-                    ui.label(if self.writable { "Index: local, writable" } else { "Index: read-only" });
+                    ui.label("Index: local, editable");
+                    let scan_label = if self.scan_events.is_some() { "Scanning…" } else { "Scan / Rescan archive" };
+                    if ui.add_enabled(self.scan_events.is_none() && self.open_events.is_none(), egui::Button::new(scan_label))
+                        .on_hover_text("Inventory files and extract provenance; works even if no previous scan exists")
+                        .clicked() { self.tab = Tab::Build; self.begin_scan(); }
                 }
             });
             ui.horizontal(|ui| {
@@ -519,15 +611,41 @@ impl eframe::App for App {
                     egui::RichText::new(if self.scan_events.is_some() { "WORKING…" } else { "RE-RESOLVE" })
                         .strong().color(egui::Color32::WHITE),
                 ).fill(egui::Color32::from_rgb(170, 40, 40));
-                if ui.add_enabled(self.writable && self.db.is_some() && self.scan_events.is_none(), button)
+                if ui.add_enabled(self.db.is_some() && self.scan_events.is_none(), button)
                     .on_hover_text("Recompute stored notebook and script-chain candidates; no file scan; keep manual resolutions")
                     .clicked() { self.begin_relink(); }
 
             });
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| { ui.label(&self.status); });
+        if let Some(message) = self.error_popup.clone() {
+            egui::Window::new("⚠ FolderHistory operation failed")
+                .collapsible(false).resizable(true).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.colored_label(egui::Color32::YELLOW, "The operation could not complete.");
+                    ui.label(&message);
+                    if ui.button("Close").clicked() { self.error_popup = None; }
+                });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.db.is_none() {
+                if let Some(folder) = self.missing_index.clone() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.colored_label(egui::Color32::YELLOW, "⚠ This folder has not been indexed yet");
+                        ui.label(format!("Folder: {}", folder.display()));
+                        ui.label("No FolderHistory database was found. Create an index and scan this folder?");
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(self.open_events.is_none(), egui::Button::new("Create index & Analyze")).clicked() {
+                                self.open(folder, true);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.missing_index = None;
+                                self.status = "Index creation cancelled; no files changed.".into();
+                            }
+                        });
+                    });
+                    ui.separator();
+                }
                 ui.heading("Welcome to FolderHistory");
                 if !self.recent_folders.is_empty() {
                     ui.add_space(10.0);
@@ -654,9 +772,6 @@ impl eframe::App for App {
                     ui.heading("Build / Repair");
                     if let Some(root) = &self.root { ui.label(format!("Archive: {}", root.display())); }
                     if let Some(path) = &self.index_path { ui.label(format!("Index: {}", path.display())); }
-                    if !self.writable {
-                        ui.label("Read-only inspection: problems, evidence, and existing resolutions are visible below. To make corrections, use Analyze a folder to create a writable local index; the archive database is not modified.");
-                    }
                     ui.label(format!("{} indexed files; {} relationships; {} open issue occurrences",self.artifacts.len(),self.relations.len(),self.issues.iter().filter(|issue| issue.decision == "open").count()));
                     ui.separator();
                     ui.heading("Analysis graph context");
@@ -680,10 +795,10 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.label("Analysis name:");
                             ui.text_edit_singleline(&mut self.group_name_edit);
-                            if ui.add_enabled(self.writable && !self.group_name_edit.trim().is_empty(), egui::Button::new("Save name")).clicked() {
+                            if ui.add_enabled(!self.group_name_edit.trim().is_empty(), egui::Button::new("Save name")).clicked() {
                                 if let Some(db) = &self.db {
                                     let result = db.execute("INSERT INTO analysis_names(source_folder,display_name) VALUES(?1,?2) ON CONFLICT(source_folder) DO UPDATE SET display_name=excluded.display_name", params![self.group_filter, self.group_name_edit.trim()]);
-                                    match result { Ok(_) => { self.group_names.insert(self.group_filter.clone(), self.group_name_edit.trim().to_owned()); self.status="Analysis name saved".into(); }, Err(e) => self.status=format!("Name save failed: {e}") }
+                                    match result { Ok(_) => { self.group_names.insert(self.group_filter.clone(), self.group_name_edit.trim().to_owned()); self.status="Analysis name saved".into(); self.publish(); }, Err(e) => self.status=format!("Name save failed: {e}") }
                                 }
                             }
                         });
@@ -691,15 +806,17 @@ impl eframe::App for App {
                     ui.small("Issues are organized by their source script's analysis. Candidate assignments below are suggestions, not new provenance edges.");
                     let unassigned: Vec<&Issue> = self.issues.iter().filter(|i| i.decision == "open" && !self.analysis_assignment.contains_key(&i.notebook)).collect();
                     ui.collapsing(format!("Unassigned to an analysis · {} issue occurrences", unassigned.len()), |ui| {
-                        let mut by_dependency = BTreeMap::<(String, String), &Issue>::new();
-                        for issue in &unassigned { by_dependency.entry((issue.category.clone(), issue.filename.clone())).or_insert(issue); }
+                        let mut by_dependency = BTreeMap::<(String, String, String), &Issue>::new();
+                        for issue in &unassigned { by_dependency.entry((issue.notebook.clone(), issue.category.clone(), issue.filename.clone())).or_insert(issue); }
                         ui.label("Suggestions are ranked from recorded provenance and indexed filename matches. Nothing is assigned automatically.");
                         egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                            for ((category, filename), issue) in by_dependency {
+                            for ((source, category, filename), issue) in by_dependency {
                                 let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui.link(format!("{filename} · {category}")).clicked() {
+                                    if ui.link(format!("{filename} · {category} · {source}")).clicked() {
                                         self.active_dependency = Some((category.clone(), filename.clone()));
+                                        self.wizard_index = self.issues.iter().position(|i| i.notebook == source && i.filename == filename && i.category == category).unwrap_or(0);
+                                        self.wizard_mode = true;
                                     }
                                     if let Some((group, score, reason)) = ranked.first() {
                                         let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
@@ -721,8 +838,8 @@ impl eframe::App for App {
                         }
                     });
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(self.writable && self.scan_events.is_none(), egui::Button::new("Publish index into archive")).clicked() { self.publish(); }
-                        if ui.button("Generate README.html").clicked() { self.export_readme(); }
+                        if ui.add_enabled(self.scan_events.is_none(), egui::Button::new("Publish index into archive")).clicked() { self.publish(); }
+                        if ui.button("Generate README.md + HTML").clicked() { self.export_readme(); }
                     });
                     ui.separator();
                     ui.heading("Evidence");
@@ -758,7 +875,7 @@ impl eframe::App for App {
                                 if category == "resolved" { i.decision != "open" }
                                 else if category == "all" { i.decision == "open" }
                                 else { i.category == category && i.decision == "open" }
-                            }).map(|i| (i.category.as_str(), i.filename.as_str()))
+                            }).map(|i| (i.notebook.as_str(), i.filename.as_str()))
                               .collect::<HashSet<_>>().len();
                             if ui.selectable_label(self.issue_filter == category, format!("{category} ({n})")).clicked() {
                                 self.issue_filter = category.into();
@@ -767,122 +884,41 @@ impl eframe::App for App {
                         }
                     });
                     ui.separator();
-                    if let Some((category, filename)) = self.active_dependency.clone() {
-                        if ui.button("← Back to evidence").clicked() { self.active_dependency = None; }
-                        ui.heading(&filename);
-                        ui.label(format!("Category: {category}"));
-                        if let Some(issue) = self.issues.iter().find(|i| i.category == category && i.filename == filename) {
-                            let ranked = issue_analysis_candidates(issue, &self.analysis_assignment, &self.artifacts, &self.relations);
-                            if !ranked.is_empty() {
-                                ui.collapsing("Candidate analyses (advisory)", |ui| {
-                                    for (group, score, reason) in ranked.iter().take(5) {
-                                        let name = self.group_names.get(group).cloned().or_else(|| self.analysis_groups.iter().find(|g| &g.key == group).map(|g| g.suggested_name.clone())).unwrap_or_else(|| group.clone());
-                                        ui.label(format!("{name} · {score}/100 · {reason}"));
-                                    }
-                                });
-                            }
-                        }
-                        let occurrences: Vec<Issue> = self.issues.iter()
-                            .filter(|i| i.category == category && i.filename == filename).cloned().collect();
-                        ui.label(format!("{} occurrences", occurrences.len()));
-                        if let Some(first) = occurrences.first() {
-                            ui.label(format!("Current decision: {}", first.decision));
-                        }
-                        ui.separator();
-                        ui.heading("Resolution");
-                        ui.label("A decision applies to every occurrence of this dependency in this category.");
-                        ui.label("Location, external URL, or handover explanation:");
-                        if let Some(url) = lookup_global_external_link(&filename) {
-                            ui.label(format!("Reusable external resource candidate: {url}"));
-                            if ui.button("Use registry URL as explanation").clicked() { self.resolution_note = url; }
-                        }
-                        ui.text_edit_multiline(&mut self.resolution_note);
-                        ui.horizontal_wrapped(|ui| {
-                            for (label, decision) in [
-                                ("Missing", "missing"),
-                                ("Intentional external", "intentional_external"),
-                                ("False positive", "ignored"),
-                                ("Reopen", "open"),
-                            ] {
-                                if ui.add_enabled(self.writable, egui::Button::new(label)).clicked() {
-                                    let note = self.resolution_note.clone();
-                                    self.resolve_dependency(&category, &filename, decision, &note);
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.heading("Occurrences / source evidence");
-                        let root = self.root.clone();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for issue in &occurrences {
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("Open source").on_hover_text(&issue.notebook).clicked() {
-                                        if let Some(root) = &root {
-                                            if let Err(e) = open_indexed_file(root, &issue.notebook) {
-                                                self.status = format!("Cannot open source: {e}");
-                                            }
-                                        }
-                                    }
-                                    ui.collapsing(format!("{} · cell/line {} · {}", issue.notebook, issue.cell, issue.decision), |ui| {
-                                    if let Some(root) = &root {
-                                        let path = root.join(&issue.notebook);
-                                        if path.extension().is_some_and(|ext| ext == "ipynb") {
-                                            match std::fs::read_to_string(&path)
-                                                .ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                                                .and_then(|v| v.get("cells")?.as_array()?.get((issue.cell - 1).max(0) as usize).cloned()) {
-                                                Some(cell) => {
-                                                    let source = match cell.get("source") {
-                                                        Some(serde_json::Value::String(s)) => s.clone(),
-                                                        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
-                                                        _ => String::new(),
-                                                    };
-                                                    ui.add(egui::Label::new(egui::RichText::new(source).monospace()).wrap());
-                                                }
-                                                None => { ui.label("Notebook cell unavailable."); }
-                                            }
-                                        } else {
-                                            match std::fs::read_to_string(&path) {
-                                                Ok(source) => {
-                                                    let lines: Vec<&str> = source.lines().collect();
-                                                    let line = (issue.cell - 1).max(0) as usize;
-                                                    let from = line.min(lines.len()).saturating_sub(4);
-                                                    let to = (line + 5).min(lines.len());
-                                                    for (offset, text) in lines[from..to].iter().enumerate() {
-                                                        ui.monospace(format!("{:>5}  {}", from + offset + 1, text));
-                                                    }
-                                                }
-                                                Err(_) => { ui.label("Source file unavailable."); }
-                                            }
-                                        }
-                                    }
-                                    });
-                                });
-                            }
-                        });
-                    } else {
-                        let mut groups = std::collections::BTreeMap::<(String,String),usize>::new();
+                    {
+
+                        let mut groups = std::collections::BTreeMap::<(String,String,String),usize>::new();
                         for issue in &self.issues {
                             let show = match self.issue_filter.as_str() {
                                 "resolved" => issue.decision != "open",
                                 "all" => issue.decision == "open",
                                 category => issue.category == category && issue.decision == "open",
                             };
-                            if show && (self.group_filter.is_empty() || self.analysis_assignment.get(&issue.notebook)==Some(&self.group_filter)) { *groups.entry((issue.category.clone(),issue.filename.clone())).or_default() += 1; }
+                            if show && (self.group_filter.is_empty() || self.analysis_assignment.get(&issue.notebook)==Some(&self.group_filter)) { *groups.entry((issue.notebook.clone(),issue.category.clone(),issue.filename.clone())).or_default() += 1; }
                         }
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for ((category, filename), count) in groups {
-                                if ui.selectable_label(false, format!("{filename} ({count})  ·  {category}")).clicked() {
+                        let focus = self.recently_confirmed.take();
+                        egui::ScrollArea::vertical().id_salt("issue_list").max_height(320.0).show(ui, |ui| {
+                            for ((source, category, filename), count) in groups {
+                                let is_recent = focus.as_ref().is_some_and(|(s, p)| s == &source && (p == &filename || filename.ends_with(p)));
+                                let response = ui.selectable_label(is_recent, format!("{filename} ({count})  ·  {category} · {source}"));
+                                if is_recent { response.scroll_to_me(Some(egui::Align::Center)); }
+                                if response.clicked() {
                                     self.resolution_note = self.issues.iter()
-                                        .find(|i| i.category == category && i.filename == filename)
+                                        .find(|i| i.notebook == source && i.category == category && i.filename == filename)
                                         .map(|i| i.note.clone()).unwrap_or_default();
-                                    self.active_dependency = Some((category,filename));
+                                    self.wizard_index = self.issues.iter().position(|i| i.notebook == source && i.filename == filename && i.category == category).unwrap_or(0);
+                                    self.active_dependency = Some((category, filename));
+                                    self.wizard_mode = true;
+                                    ui.ctx().request_repaint();
                                 }
                             }
                         });
                     }
                     ui.label("Default scan excludes all dot-folders, dot-files and generated work/ directories.");
+                    if self.scan_events.is_none() && self.db.is_some() {
+                        ui.label("Use Scan / Rescan archive to start the first scan or refresh an existing one.");
+                    }
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(self.writable && self.scan_events.is_none(), egui::Button::new("Re-scan archive")).clicked() {
+                        if ui.add_enabled(self.root.is_some() && self.scan_events.is_none() && self.open_events.is_none(), egui::Button::new("Scan / Rescan archive")).clicked() {
                             self.begin_scan();
                         }
                         if let Some(db) = &self.db {
@@ -895,7 +931,7 @@ impl eframe::App for App {
                                 Ok((files, steps, links)) => {
                                     ui.label(format!("Last successful scan: {files} files, {steps} steps, {links} references"));
                                 }
-                                Err(_) => { ui.label("No successful scan recorded yet"); }
+                                Err(_) => { ui.colored_label(egui::Color32::YELLOW, "No successful scan recorded yet — start a scan above."); }
                             }
                         }
                     });
@@ -913,7 +949,7 @@ impl eframe::App for App {
                     ui.label("Target path (relative to archive)"); ui.text_edit_singleline(&mut self.to);
                     ui.label("Relationship type (e.g. reads, writes, derived_from)"); ui.text_edit_singleline(&mut self.relation_kind);
                     ui.label("Evidence / note"); ui.text_edit_singleline(&mut self.note);
-                    if ui.add_enabled(self.writable && !self.from.trim().is_empty() && !self.to.trim().is_empty(),egui::Button::new("Save relationship")).clicked() { self.add_manual(); }
+                    if ui.add_enabled(!self.from.trim().is_empty() && !self.to.trim().is_empty(),egui::Button::new("Save relationship")).clicked() { self.add_manual(); }
                     ui.separator(); ui.label("Manual relationships survive rescanning. Automatic notebook references are refreshed.");
                 }
             }

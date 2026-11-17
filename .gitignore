@@ -1,4 +1,5 @@
 /target
+*.rej
 /test_output
 *.swp
 /.cargo/

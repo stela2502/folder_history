@@ -43,3 +43,20 @@ functions:
     default_output: cluster_marker_summary.csv
     files: [cluster_label_proposals.csv]
     source: stela2502/ScanpyAutoAnalyzer functions.py
+
+# Canonical names are resolved from Python imports (including aliases).
+# Only link figure files that actually exist in the indexed archive.
+# Scanpy/scVelo filename conventions vary by plotting function/version.
+plotting:
+  - module: scanpy.pl
+    save_argument: save
+    directory_setting: scanpy.settings.figdir
+    default_directory: figures
+    format_setting: scanpy.settings.file_format_figs
+    default_format: png
+  - module: scvelo.pl
+    save_argument: save
+    directory_setting: scvelo.settings.figdir
+    default_directory: figures
+    format_setting: scvelo.settings.file_format_figs
+    default_format: png

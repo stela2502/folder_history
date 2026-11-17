@@ -10,6 +10,7 @@ pub mod engine;
 pub mod provenance;
 pub mod analysis_graph;
 pub mod report;
+pub mod documentation;
 
 pub use model::*;
 pub use engine::*;

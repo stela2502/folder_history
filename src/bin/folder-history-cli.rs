@@ -1,27 +1,39 @@
-use folder_history::core::batch_scan_folder;
+use folder_history::core::{batch_scan_folder, documentation};
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 fn usage() {
-    eprintln!("Usage: folder-history-cli sub-folders-of <main-folder> [--resume] [--rescan] [--jobs N]");
+    eprintln!("Usage: folder-history-cli sub-folders-of <main-folder> [--resume] [--rescan] [--jobs N] [--write-readme]");
+    eprintln!("       folder-history-cli generate-readme <indexed-research-folder>");
     eprintln!("Each immediate subfolder is scanned into its own local FolderHistory index.");
     eprintln!("Default: --jobs 1; skip existing databases. --rescan: refresh while retaining manual decisions.");
 }
 
 fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() != Some("sub-folders-of") { usage(); anyhow::bail!("Expected sub-folders-of"); }
+    let command = args.next();
+    if command.as_deref() == Some("generate-readme") {
+        let folder = args.next().ok_or_else(|| anyhow::anyhow!("Missing research folder"))?;
+        if args.next().is_some() { anyhow::bail!("Unexpected additional argument"); }
+        let root = PathBuf::from(folder).canonicalize()?;
+        let outcome = documentation::generate_from_index(&root)?;
+        println!("{}: {}", root.display(), outcome.summary());
+        return Ok(());
+    }
+    if command.as_deref() != Some("sub-folders-of") { usage(); anyhow::bail!("Expected sub-folders-of or generate-readme"); }
     let Some(root_arg) = args.next() else { usage(); anyhow::bail!("Missing main folder"); };
     let root = PathBuf::from(root_arg).canonicalize()?;
     if !root.is_dir() { anyhow::bail!("Not a directory: {}", root.display()); }
     let mut rescan = false;
+    let mut write_readme = false;
     let mut jobs = 1usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--resume" => {}, // Skipping indexed folders is the default.
             "--rescan" => rescan = true,
+            "--write-readme" => write_readme = true,
             "--jobs" => {
                 let value = args.next().ok_or_else(|| anyhow::anyhow!("--jobs requires a number"))?;
                 jobs = value.parse::<usize>()
@@ -66,7 +78,12 @@ fn run() -> anyhow::Result<()> {
                 };
                 let Some((index, folder)) = task else { break };
                 eprintln!("[START {}/{}] {}", index + 1, queue_total, folder.display());
-                let result = batch_scan_folder(&folder, rescan);
+                let result = batch_scan_folder(&folder, rescan).and_then(|message| {
+                    if write_readme {
+                        let outcome = documentation::generate_from_index(&folder)?;
+                        Ok(format!("{message}; {}", outcome.summary()))
+                    } else { Ok(message) }
+                });
                 if sender.send((index, folder, result)).is_err() { break; }
             }
         }));

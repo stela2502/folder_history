@@ -4,7 +4,23 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-struct RuleSet { version: u32, functions: Vec<FunctionRule> }
+struct RuleSet {
+    version: u32,
+    functions: Vec<FunctionRule>,
+    #[serde(default)]
+    plotting: Vec<PlotRule>,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct PlotRule {
+    module: String,
+    save_argument: String,
+    directory_setting: String,
+    default_directory: String,
+    format_setting: String,
+    default_format: String,
+    #[serde(default)]
+    prefix_overrides: HashMap<String, String>,
+}
 #[derive(Debug, Deserialize)]
 struct FunctionRule {
     name: String,
@@ -17,27 +33,64 @@ struct FunctionRule {
     #[serde(default)] source: String,
 }
 
+// Layered rule libraries: built-in < configured external < archive-local.
+// Existing provenance_rules.yaml remains supported for compatibility.
+fn rule_layers(root: &Path) -> Result<Vec<RuleSet>> {
+    let builtin: RuleSet = serde_yaml::from_str(include_str!("../../rules/scientific_functions.yaml"))?;
+    let mut layers = vec![builtin];
+    if let Some(configured) = std::env::var_os("FOLDER_HISTORY_RULES") {
+        for path in std::env::split_paths(&configured) {
+            if !path.is_file() {
+                anyhow::bail!("Configured provenance rule file does not exist: {}", path.display());
+            }
+            layers.push(read_rule_set(&path)?);
+        }
+    }
+    for name in ["provenance_rules.yaml", "extensions.yaml"] {
+        let path = root.join(".folder_history").join(name);
+        if path.is_file() { layers.push(read_rule_set(&path)?); }
+    }
+    Ok(layers)
+}
+
+fn read_rule_set(path: &Path) -> Result<RuleSet> {
+    let rules: RuleSet = serde_yaml::from_str(&std::fs::read_to_string(path)?)
+        .with_context(|| format!("Parsing provenance rules {}", path.display()))?;
+    if rules.version != 1 {
+        anyhow::bail!("Unsupported provenance rules version in {}", path.display());
+    }
+    Ok(rules)
+}
+
 fn load_rules(root: &Path) -> Result<Vec<FunctionRule>> {
-    let mut builtins: RuleSet = serde_yaml::from_str(include_str!("../../rules/scientific_functions.yaml"))?;
-    if builtins.version != 1 { anyhow::bail!("Unsupported built-in rule version"); }
-    let custom = root.join(".folder_history/provenance_rules.yaml");
-    if custom.is_file() {
-        let extra: RuleSet = serde_yaml::from_str(&std::fs::read_to_string(&custom)?)?;
-        if extra.version != 1 { anyhow::bail!("Unsupported provenance rules version in {}", custom.display()); }
-        // Project-local rules override bundled rules by function name and language.
-        for rule in extra.functions {
-            builtins.functions.retain(|r| !(r.name == rule.name && r.language == rule.language));
-            builtins.functions.push(rule);
+    let mut combined: Vec<FunctionRule> = Vec::new();
+    for layer in rule_layers(root)? {
+        for rule in layer.functions {
+            if rule.name.is_empty() || !matches!(rule.language.as_str(), "r" | "python")
+                || rule.directory_arg == Some(0) || rule.output_arg == Some(0)
+                || (rule.directory_arg.is_none() && rule.output_arg.is_none()) {
+                anyhow::bail!("Invalid provenance function rule: {}", rule.name);
+            }
+            combined.retain(|r| !(r.name == rule.name && r.language == rule.language));
+            combined.push(rule);
         }
     }
-    for rule in &builtins.functions {
-        if rule.name.is_empty() || !matches!(rule.language.as_str(), "r" | "python")
-            || rule.directory_arg == Some(0) || rule.output_arg == Some(0)
-            || (rule.directory_arg.is_none() && rule.output_arg.is_none()) {
-            anyhow::bail!("Invalid provenance function rule: {}", rule.name);
+    Ok(combined)
+}
+
+fn load_plot_rules(root: &Path) -> Result<Vec<PlotRule>> {
+    let mut combined: Vec<PlotRule> = Vec::new();
+    for layer in rule_layers(root)? {
+        for plot in layer.plotting {
+            if plot.module.is_empty() || plot.save_argument.is_empty()
+                || plot.default_directory.is_empty() || plot.default_format.is_empty() {
+                anyhow::bail!("Invalid plotting rule: {}", plot.module);
+            }
+            combined.retain(|p| p.module != plot.module);
+            combined.push(plot);
         }
     }
-    Ok(builtins.functions)
+    Ok(combined)
 }
 
 fn rule_output(db: &Connection, rel: &str, line: usize, candidate: &str, rule: &FunctionRule,
@@ -194,7 +247,90 @@ fn file_operation(label: &str) -> bool {
     direction(&lower)!="references" || lower.ends_with("to_csv") || lower.ends_with("to_parquet")
 }
 //fn is_identifier(c:char)->bool {c.is_ascii_alphanumeric() || c=='_' || c=='.'}
-fn operations(source:&str, rules:&[FunctionRule])->Vec<(usize,String,usize)> {
+// Resolve Python import aliases to canonical module/function paths.
+fn python_imports(source: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for line in source.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = line.strip_prefix("import ") {
+            for entry in rest.split(',') {
+                let words: Vec<_> = entry.split_whitespace().collect();
+                if let Some(module) = words.first() {
+                    if words.len() == 1 {
+                        let root = module.split('.').next().unwrap_or(module);
+                        aliases.insert(root.to_string(), root.to_string());
+                    } else if words.len() == 3 && words[1] == "as" {
+                        aliases.insert(words[2].to_string(), (*module).to_string());
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("from ") {
+            if let Some((module, names)) = rest.split_once(" import ") {
+                for entry in names.split(',') {
+                    let words: Vec<_> = entry.split_whitespace().collect();
+                    if let Some(item) = words.first() {
+                        if *item == "*" { continue; }
+                        let alias = if words.len() == 3 && words[1] == "as" { words[2] } else { item };
+                        aliases.insert(alias.to_string(), format!("{module}.{item}"));
+                    }
+                }
+            }
+        }
+    }
+    aliases
+}
+fn canonical(label: &str, imports: &HashMap<String, String>) -> String {
+    let (head, rest) = label.split_once('.').unwrap_or((label, ""));
+    match imports.get(head) {
+        Some(module) if rest.is_empty() => module.clone(),
+        Some(module) => format!("{module}.{rest}"),
+        None => label.to_string(),
+    }
+}
+fn plot_outputs(
+    db: &Connection, rel: &str, line: usize, canonical_call: &str,
+    args: &str, vars: &HashMap<String, String>, paths: &HashSet<String>,
+    plots: &[PlotRule],
+) -> Result<usize> {
+    let mut count = 0;
+    for rule in plots {
+        let Some(function) = canonical_call.strip_prefix(&(rule.module.clone() + ".")) else { continue };
+        if function.contains('.') { continue; }
+        let Some(save_expr) = split_args(args).into_iter().find_map(|arg| {
+            let (key, val) = arg.split_once('=')?;
+            (key.trim() == rule.save_argument).then(|| val.trim().to_string())
+        }) else { continue };
+        if save_expr == "False" || save_expr == "None" { continue; }
+        let suffix = if save_expr == "True" {
+            String::new()
+        } else if let Some(v) = value(&save_expr, vars) {
+            if v.is_empty() { continue; }
+            v
+        } else { continue };
+        let directory = vars.get(&rule.directory_setting)
+            .cloned().unwrap_or_else(|| rule.default_directory.clone());
+        let format = vars.get(&rule.format_setting)
+            .cloned().unwrap_or_else(|| rule.default_format.clone());
+        let prefix = rule.prefix_overrides.get(function).map(String::as_str).unwrap_or(function);
+        let suffix = if suffix.rsplit('/').next().unwrap_or("").contains('.') {
+            suffix
+        } else {
+            format!("{suffix}.{}", format.trim_start_matches('.'))
+        };
+        let candidate = format!("{directory}/{prefix}{suffix}");
+        let (resolved, external, ambiguous) = resolve_reference(&candidate, rel, paths);
+        if !external && !ambiguous {
+            if let Some(target) = resolved {
+                let evidence = format!("{rel}: line/cell {line}: inferred {} save output ({canonical_call})", rule.module);
+                add_relation(db, rel, &target, "writes", &evidence, false)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String>, plots:&[PlotRule])->Vec<(usize,String,usize)> {
     let bytes=source.as_bytes(); let mut found=Vec::new();
     let mut i=0; let mut quote:Option<u8>=None; let mut escaped=false; let mut comment=false;
     while i<bytes.len() {
@@ -212,7 +348,7 @@ fn operations(source:&str, rules:&[FunctionRule])->Vec<(usize,String,usize)> {
             while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i]==b'_' || bytes[i]==b'.') {i+=1;}
             let label=&source[start..i];
             let mut open=i;while open<bytes.len() && bytes[open].is_ascii_whitespace(){open+=1;}
-            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.name == label.rsplit('.').next().unwrap_or(label))) {
+            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.name == label.rsplit('.').next().unwrap_or(label)) || plots.iter().any(|p| canonical(label, imports).starts_with(&(p.module.clone()+".")))) {
                 let line=source[..start].bytes().filter(|b|*b==b'\n').count()+1;
                 found.push((line,label.to_owned(),open+1));
             }
@@ -278,10 +414,11 @@ fn filename_args(label:&str, s:&str, vars:&HashMap<String,String>)->Vec<(String,
     }
     found
 }
-fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule])->Result<usize> {
+fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule])->Result<usize> {
     let assign=Regex::new(r#"^\s*(?:export\s+)?([A-Za-z_][\w.]*)\s*(?:<-|=)\s*(.*?)\s*$"#)?;
     let mut count=0;
-    let ops=operations(source,rules);
+    imports.extend(python_imports(source));
+    let ops=operations(source,rules,imports,plots);
     // Assignments are tracked in source order, but unresolved assignments
     // invalidate earlier values rather than retaining stale provenance.
     let mut assignments:Vec<(usize,String,String)>=Vec::new();
@@ -310,6 +447,9 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
         let limit=if !balanced {next.map_or(end,|n|end.min(n))}else{end};
         let args=&remaining[..limit.min(remaining.len())];
         if balanced {
+            if !rel.to_ascii_lowercase().ends_with(".r") {
+                count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, vars, paths, plots)?;
+            }
             let name=label.rsplit('.').next().unwrap_or(label);
             let language=if rel.to_ascii_lowercase().ends_with(".r") {"r"} else {"python"};
             for rule in rules.iter().filter(|r|r.name==name && (r.language==language || rel.ends_with(".ipynb"))) {
@@ -364,7 +504,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     }
     Ok(count)
 }
-fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule])->Result<usize> {
+fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule],plots:&[PlotRule])->Result<usize> {
     let mut vars=HashMap::new();let mut count=0;
     if shell {
         for (line,raw) in lines {
@@ -378,32 +518,59 @@ fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<
     }
     let mut source=String::new();
     for (_,line) in lines {source.push_str(line);source.push('\n');}
-    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules)?;
+    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules,&mut HashMap::new(),plots)?;
     Ok(count)
 }
 pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->Result<usize>{
     let rules=load_rules(root)?;
+    let plots=load_plot_rules(root)?;
     let content=std::fs::read_to_string(root.join(rel))?;
     if rel.ends_with(".ipynb") {
         let notebook:serde_json::Value=serde_json::from_str(&content)?;
-        let mut vars=HashMap::new();let mut count=0;
+        let mut vars=HashMap::new();let mut imports=HashMap::new();let mut count=0;
         if let Some(cells)=notebook["cells"].as_array() {
             for (idx,cell) in cells.iter().enumerate() {
                 if cell["cell_type"]!="code" {continue;}
                 let src=if let Some(a)=cell["source"].as_array(){a.iter().filter_map(|v|v.as_str()).collect::<String>()}else{cell["source"].as_str().unwrap_or("").to_string()};
-                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules)?;
+                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules,&mut imports,&plots)?;
             }
         }
         Ok(count)
     } else {
         let shell=rel.ends_with(".sh")||rel.ends_with(".bash");
         let lines:Vec<(usize,String)>=content.lines().enumerate().map(|(i,s)|(i+1,s.to_owned())).collect();
-        analyze_lines(db,rel,&lines,paths,shell,&rules)
+        analyze_lines(db,rel,&lines,paths,shell,&rules,&plots)
     }
 }
 
 #[cfg(test)] mod tests {
  use super::*;
+ #[test] fn python_import_aliases_are_canonical() {
+     let imports=python_imports("import scanpy as sc\nfrom scanpy import pl as plotting\nfrom scvelo.pl import velocity_embedding_stream as ves\n");
+     assert_eq!(canonical("sc.pl.umap", &imports), "scanpy.pl.umap");
+     assert_eq!(canonical("plotting.umap", &imports), "scanpy.pl.umap");
+     assert_eq!(canonical("ves", &imports), "scvelo.pl.velocity_embedding_stream");
+ }
+ #[test]
+ fn archive_extensions_override_builtin_function_rule() -> Result<()> {
+     let temp = std::env::temp_dir().join(format!("folder-history-rule-test-{}", std::process::id()));
+     let folder = temp.join(".folder_history");
+     std::fs::create_dir_all(&folder)?;
+     std::fs::write(folder.join("extensions.yaml"), "version: 1\nfunctions:\n  - name: export2cellexalvr\n    language: r\n    directory_arg: 2\n    patterns: ['*.tsv']\n    source: test override\n")?;
+     let result = load_rules(&temp);
+     let _ = std::fs::remove_dir_all(&temp);
+     let rules = result?;
+     let matching: Vec<_> = rules.iter().filter(|r| r.name == "export2cellexalvr").collect();
+     assert_eq!(matching.len(), 1);
+     assert_eq!(matching[0].patterns, vec!["*.tsv"]);
+     Ok(())
+ }
+
+ #[test] fn builtin_plot_rules_exist() {
+     let rules=load_plot_rules(Path::new("/nonexistent-folderhistory-rule-test")).unwrap();
+     assert!(rules.iter().any(|r| r.module=="scanpy.pl"));
+     assert!(rules.iter().any(|r| r.module=="scvelo.pl"));
+ }
  // Regression: malformed source code must never crash the provenance scanner.
  // This test is intentionally RED against the overnight-run implementation.
  #[test] fn malformed_fstrings_do_not_panic() {
@@ -590,8 +757,8 @@ mod bioinformatics_nasty_provenance_tests {
             "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
         ].into_iter().map(str::to_owned).collect();
         let mut vars = HashMap::new();
-        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules)?;
-        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules)?;
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules, &mut HashMap::new(), &[])?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules, &mut HashMap::new(), &[])?;
         let targets = db.prepare("SELECT target FROM relations")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
