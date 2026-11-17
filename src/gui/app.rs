@@ -190,6 +190,8 @@ impl App {
                 self.scan_after_open = false;
                 self.tab = Tab::Build;
                 self.begin_scan();
+            } else {
+                self.ensure_missing_html();
             }
         } else if self.open_events.as_ref().is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))) {
             self.open_events = None;
@@ -230,6 +232,7 @@ impl App {
                 self.selected = None; self.active_dependency = None; self.group_filter.clear();
                 self.tab = if analyze { Tab::Build } else { Tab::Spectator };
                 self.refresh(); self.status = format!("Opened local copy of {}", archive.display());
+                if !analyze { self.ensure_missing_html(); }
                 if let Some(e) = recent_save_error {
                     self.status.push_str(&format!(" (could not save recent folders: {e})"));
                 }
@@ -237,6 +240,19 @@ impl App {
             Err(e) => self.status = format!("Cannot open folder history: {e:#}"),
         }
     }
+    // Documentation is a researcher-facing convenience, not a scan prerequisite.
+    // Only generate absent HTML; never touch README.md or replace existing HTML.
+    fn ensure_missing_html(&mut self) {
+        let Some(root) = self.root.as_ref() else { return; };
+        match folder_history::core::documentation::generate_missing_html(
+            root, &self.artifacts, &self.relations, &self.issues,
+        ) {
+            Ok(true) => self.status.push_str(" · Created README.html"),
+            Ok(false) => {},
+            Err(e) => self.status.push_str(&format!(" · README.html not created: {e}")),
+        }
+    }
+
     pub(crate) fn refresh(&mut self) {
         self.artifacts.clear(); self.relations.clear(); self.issues.clear(); self.group_names.clear();
         self.analysis_groups.clear(); self.analysis_assignment.clear();
@@ -426,6 +442,7 @@ impl App {
                     self.status = self.scan_summary.clone();
                     self.refresh();
                     self.publish();
+                    self.ensure_missing_html();
                 }
                 Err(e) => {
                     self.scan_summary = format!("Re-scan did not complete: {e}");

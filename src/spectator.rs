@@ -16,6 +16,21 @@ fn apply_file_action(app: &mut App, ui: &mut egui::Ui, path: &str, id: Option<i6
 }
 
 
+fn is_fastq(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".fastq", ".fastq.gz", ".fq", ".fq.gz"].iter().any(|ext| lower.ends_with(ext))
+}
+
+fn display_sample_label(sample: &str) -> String {
+    if sample == "Shared / unspecified sample" { return "Shared files / unassigned".to_owned(); }
+    let lower = sample.to_ascii_lowercase();
+    if [".txt", ".ipynb", ".py", ".r", ".sh", ".zip", ".pdf", ".csv", ".tsv"]
+        .iter().any(|ext| lower.ends_with(ext)) {
+        return format!("File / collection: {sample}");
+    }
+    format!("Folder / possible sample: {sample}")
+}
+
 fn file_role(path: &str, kind: &str, relations: &[Relation]) -> (egui::Color32, &'static str) {
     let lower = path.to_ascii_lowercase();
     let suffix = lower.rsplit('.').next().unwrap_or("");
@@ -237,7 +252,10 @@ impl App {
     pub(crate) fn show_spectator(&mut self, ui: &mut egui::Ui) {
 
                     ui.heading("Scientific analyses · Spectator");
-                    ui.label("Experiment → sample/run → workflow → files. Double-click a filename to open it.");
+                    ui.label("Browse inferred groups → folders / possible samples → workflows → files. Double-click a filename to open it.");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("□ Input   ● Script   ▶ Results   ·   Colors show detailed file types below");
+                    });
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(100,175,255), "● raw");
                         ui.colored_label(egui::Color32::from_rgb(180,125,240), "● processing");
@@ -257,8 +275,9 @@ impl App {
                             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()?;
                             Some(rows.flatten().collect())
                         }).unwrap_or_default();
-                    ui.label(format!("{} detected groups · {} indexed files · {} confirmed classifications",
-                        self.analysis_groups.len(), self.artifacts.len(), confirmed.len()));
+                    let fastq_count = self.artifacts.iter().filter(|a| is_fastq(&a.path)).count();
+                    ui.label(format!("{} detected groups · {} indexed files · {} FASTQ files · {} confirmed classifications",
+                        self.analysis_groups.len(), self.artifacts.len(), fastq_count, confirmed.len()));
                     if !confirmed.is_empty() {
                         ui.collapsing(format!("✓ Scientist-confirmed files and folders ({})", confirmed.len()), |ui| {
                             egui::Grid::new("confirmed_classifications_overview").striped(true).show(ui, |ui| {
@@ -282,7 +301,8 @@ impl App {
                         for group in &self.analysis_groups {
                             let title = self.group_names.get(&group.key).map(String::as_str).unwrap_or(&group.suggested_name);
                             let issues = self.issues.iter().filter(|i| self.analysis_assignment.get(&i.notebook)==Some(&group.key) && i.decision=="open").count();
-                            let header = format!("{title} · {} files · {issues} open issues · {} links", group.paths.len(), group.edge_count);
+                            let fastqs = group.paths.iter().filter(|p| is_fastq(p)).count();
+                            let header = format!("{title} · {} files ({fastqs} FASTQ) · {issues} open issues · {} links", group.paths.len(), group.edge_count);
                             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("analysis", &group.key)), false).show_header(ui, |ui| {
                                 ui.label(&header);
                                 role_summary(ui, group.paths.iter().map(String::as_str), &by_path, links);
@@ -306,6 +326,7 @@ impl App {
                                     }).body(|ui| {
                                         for (sample, workflows) in samples {
                                             let sample_count: usize = workflows.values().flat_map(|s| s.values()).map(Vec::len).sum();
+                                            let sample_fastqs = workflows.values().flat_map(|s| s.values()).flat_map(|paths| paths.iter()).filter(|p| is_fastq(p)).count();
                                             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("sample", &sample)), false).show_header(ui, |ui| {
                                                 {
                                                     let script = workflows.get("Scripts and notebooks")
@@ -313,7 +334,7 @@ impl App {
                                                             path.rsplit('/').next() == Some(sample.as_str())
                                                         }));
                                                     if let Some(path) = script {
-                                                        ui.label("Sample / run:");
+                                                        ui.label("File / collection:");
                                                         // First visible filename is actionable; the adjacent button
                                                         // is a reliable alternative to double-click in a collapsing header.
                                                         if let Some(action) = file::show(ui, &sample, path, false, None) {
@@ -322,9 +343,9 @@ impl App {
                                                         if ui.small_button("Open").on_hover_text("Open with default application").clicked() {
                                                             pending_file_actions.push((path.to_owned(), None, FileAction::Open));
                                                         }
-                                                        ui.label(format!("· {sample_count}"));
+                                                        ui.label(format!("· {sample_count} files · {sample_fastqs} FASTQ"));
                                                     } else {
-                                                        ui.label(format!("Sample / run: {sample} · {sample_count}"));
+                                                        ui.label(format!("{} · {sample_count} files · {sample_fastqs} FASTQ", display_sample_label(&sample)));
                                                     }
                                                 }
                                                 role_summary(ui, workflows.values().flat_map(|s| s.values()).flat_map(|paths| paths.iter().copied()), &by_path, links);

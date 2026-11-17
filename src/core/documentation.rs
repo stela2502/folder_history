@@ -62,7 +62,11 @@ The index is stored in `.folder_history/history.sqlite`. You do not need Python,
 
 **When to use this:** You want an overview of what experiments, samples, scripts and results exist, but do not yet know a filename.
 
-Open the **Spectator** tab (or click **⌂ Analyses**). It organizes files into expandable levels: **analysis group → experiment → sample/run → workflow → files**. Expand a heading to see its contents; the counts beside headings describe the files in that group. The grouping is a navigation aid, not a guarantee that every file belongs to one uniquely established analysis.
+Open the **Spectator** tab (or click **⌂ Analyses**). It organizes files into expandable levels: **analysis group → inferred collection → folder / possible sample → workflow → files**. Expand a heading to see its contents; the counts beside headings describe the files in that group. The grouping is a navigation aid, not a guarantee that every file belongs to one uniquely established analysis.
+
+The overview displays a total FASTQ count, and group and folder headings also report FASTQ counts (`.fastq`, `.fq` and their gzip-compressed forms). These are counts of indexed files, not inferred biological samples. Some group labels are inferred from directory names; **Folder / possible sample** does not assert that a verified sample or run was identified.
+
+The simplified navigation legend uses **□ Input**, **● Script**, and **▶ Results**. The more detailed colored categories below describe file types and should not be mistaken for independently verified provenance. Scientist-confirmed classifications, when available, are displayed separately.
 
 ### Understanding file colors
 
@@ -413,6 +417,26 @@ pub fn generate(root: &Path, artifacts: &[Artifact], relations: &[Relation], iss
         }
     }
     Ok(outcome)
+}
+
+/// Create the researcher-facing HTML only when it does not already exist.
+/// Never overwrite an existing HTML document, whether generated or researcher-authored.
+pub fn generate_missing_html(root: &Path, artifacts: &[Artifact], relations: &[Relation], issues: &[Issue]) -> Result<bool> {
+    let path = root.join("README.html");
+    if path.exists() { return Ok(false); }
+    let html = html_from_markdown(&researcher_markdown(root, artifacts, relations, issues));
+    // create_new prevents overwriting a file created concurrently by another process.
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    if let Err(e) = file.write_all(html.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e.into());
+    }
+    Ok(true)
 }
 
 pub fn generate_from_index(root: &Path) -> Result<DocumentationOutcome> {
