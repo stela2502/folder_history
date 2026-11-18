@@ -295,61 +295,6 @@ impl App {
             }
         }
     }
-    // Save a classification only for the equivalent source references shown in
-    // the wizard. Do not silently classify other calls using the same filename.
-    pub(super) fn resolve_issue_group(&mut self, ids: &[i64], decision: &str, note: &str) {
-        
-        if decision == "ignore" && note.trim().is_empty() {
-            self.status = "Ignoring a reference requires an explanation.".into();
-            return;
-        }
-        let Some(db) = &mut self.db else { return; };
-        let result: Result<()> = (|| {
-            let tx = db.transaction()?;
-            for id in ids {
-                tx.execute("UPDATE issues SET decision=?1,note=?2 WHERE id=?3",
-                    params![decision, note, id])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.refresh();
-                self.publish();
-                self.status = format!("Saved {decision} for {} source occurrence(s).", ids.len());
-            }
-            Err(e) => self.status = format!("Cannot save classification: {e:#}"),
-        }
-    }
-
-    // A resolution belongs to the dependency, not to an individual notebook cell.
-    // The existing issue table remains the source of occurrence-level evidence.
-    pub(crate) fn resolve_dependency(&mut self, category: &str, filename: &str, decision: &str, note: &str) {
-        
-        let Some(db) = &mut self.db else { return; };
-        let result: Result<usize> = (|| {
-            let tx = db.transaction()?;
-            let changed = tx.execute(
-                "UPDATE issues SET decision=?1,note=?2 WHERE category=?3 AND filename=?4",
-                params![decision,note,category,filename])?;
-            tx.commit()?;
-            Ok(changed)
-        })();
-        match result {
-            Ok(changed) => {
-                if category == "external" && decision == "intentional_external" {
-                    if let Err(e) = save_global_external_link(filename,note.trim()) {
-                        self.status = format!("Local resolution saved, global registry failed: {e}");
-                    }
-                }
-                self.refresh();
-                self.status = format!("Updated {changed} occurrences of {filename}.");
-                self.publish();
-            }
-            Err(e) => self.status = format!("Dependency resolution failed: {e:#}"),
-        }
-    }
     pub(crate) fn publish(&mut self) {
         if self.scan_events.is_some() { return; }
         let (Some(db), Some(root), Some(local)) = (&self.db, &self.root, &self.index_path) else { return; };

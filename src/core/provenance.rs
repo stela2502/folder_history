@@ -114,18 +114,18 @@ fn rule_output(db: &Connection, rel: &str, line: usize, candidate: &str, rule: &
 }
 
 fn apply_rule(db: &Connection, rel: &str, line: usize, args: &str, rule: &FunctionRule,
-              vars: &HashMap<String,String>, paths: &HashSet<String>) -> Result<usize> {
+              env: &Environment, paths: &HashSet<String>) -> Result<usize> {
     let arguments = split_args(args);
     let arg_value = |n: usize, names: &[&str]| -> Option<String> {
         if n == 0 { return None; }
         // Named arguments may appear in any position, including R's path='data'.
         for arg in &arguments {
             if let Some((key, expr)) = arg.split_once('=') {
-                if names.contains(&key.trim()) { return value(expr, vars); }
+                if names.contains(&key.trim()) { return Variable::resolve_exact(expr, env); }
             }
         }
         // Positional arguments exclude named arguments.
-        arguments.iter().filter(|a| !a.contains('=')).nth(n-1).and_then(|a| value(a, vars))
+        arguments.iter().filter(|a| !a.contains('=')).nth(n-1).and_then(|a| Variable::resolve_exact(a, env))
     };
     let mut count = 0;
     if let Some(n) = rule.output_arg {
@@ -169,6 +169,168 @@ fn apply_rule(db: &Connection, rel: &str, line: usize, args: &str, rule: &Functi
 }
 
 
+// Shared symbolic filename representation. Exact strings are also path parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PathPart {
+    Literal(String),
+    Wildcard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilePath {
+    parts: Vec<PathPart>,
+}
+
+impl FilePath {
+    fn new(parts: Vec<PathPart>) -> Self {
+        let mut normalized: Vec<PathPart> = Vec::new();
+        for part in parts {
+            match part {
+                PathPart::Literal(s) if s.is_empty() => {},
+                PathPart::Literal(s) => {
+                    if let Some(PathPart::Literal(last)) = normalized.last_mut() {
+                        last.push_str(&s);
+                    } else {
+                        normalized.push(PathPart::Literal(s));
+                    }
+                },
+                PathPart::Wildcard => {
+                    if !matches!(normalized.last(), Some(PathPart::Wildcard)) {
+                        normalized.push(PathPart::Wildcard);
+                    }
+                },
+            }
+        }
+        Self { parts: normalized }
+    }
+
+    fn matches<S: AsRef<str>>(&self, candidate: S) -> bool {
+        let candidate = candidate.as_ref();
+        fn match_at(parts: &[PathPart], text: &str) -> bool {
+            let Some((first, rest)) = parts.split_first() else { return text.is_empty(); };
+            match first {
+                PathPart::Literal(literal) => text.strip_prefix(literal)
+                    .is_some_and(|remaining| match_at(rest, remaining)),
+                PathPart::Wildcard => {
+                    if rest.is_empty() { return true; }
+                    match_at(rest, text) || text.char_indices()
+                        .skip(1).any(|(i, _)| match_at(rest, &text[i..]))
+                        || match_at(rest, "")
+                },
+            }
+        }
+        match_at(&self.parts, candidate)
+    }
+
+    fn ordered_fragments(&self) -> Vec<String> {
+        self.parts.iter().filter_map(|p| match p {
+            PathPart::Literal(s) if s.len() >= 4 => Some(s.clone()),
+            _ => None,
+        }).collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Variable {
+    Exact(String),
+    Parts(FilePath),
+    Unknown,
+}
+
+impl Variable {
+    fn matches<S: AsRef<str>>(&self, candidate: S) -> bool {
+        match self {
+            Self::Exact(s) => s == candidate.as_ref(),
+            Self::Parts(path) => path.matches(candidate),
+            Self::Unknown => false,
+        }
+    }
+
+    fn into_filepath(self) -> FilePath {
+        match self {
+            Self::Exact(s) => FilePath::new(vec![PathPart::Literal(s)]),
+            Self::Parts(path) => path,
+            Self::Unknown => FilePath::new(vec![PathPart::Wildcard]),
+        }
+    }
+
+    fn from_script_slice(source: &str, env: &Environment, _language: &str) -> Self {
+        let source = source.trim();
+        if let Some(exact) = Self::resolve_exact(source, env) {
+            return Self::Exact(exact);
+        }
+        if let Some(existing) = env.variables.get(source) {
+            return existing.clone();
+        }
+        // Preserve literal prefixes and suffixes of unresolved Python f-strings.
+        if source.len() >= 3 && (source.starts_with("f\"") || source.starts_with("f'")) {
+            let quote = source.as_bytes()[1] as char;
+            if source.ends_with(quote) {
+                let template = &source[2..source.len()-1];
+                let mut parts = Vec::new();
+                let mut literal = String::new();
+                let mut chars = template.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    if ch == '{' {
+                        if chars.peek() == Some(&'{') {
+                            chars.next(); literal.push('{'); continue;
+                        }
+                        let mut expression = String::new();
+                        let mut closed = false;
+                        for inner in chars.by_ref() {
+                            if inner == '}' { closed = true; break; }
+                            expression.push(inner);
+                        }
+                        if !closed { return Self::Unknown; }
+                        if !literal.is_empty() {
+                            parts.push(PathPart::Literal(std::mem::take(&mut literal)));
+                        }
+                        match env.variables.get(expression.trim()) {
+                            Some(Variable::Exact(value)) => parts.push(PathPart::Literal(value.clone())),
+                            Some(Variable::Parts(path)) => parts.extend(path.parts.iter().cloned()),
+                            _ => parts.push(PathPart::Wildcard),
+                        }
+                    } else if ch == '}' && chars.peek() == Some(&'}') {
+                        chars.next(); literal.push('}');
+                    } else { literal.push(ch); }
+                }
+                if !literal.is_empty() { parts.push(PathPart::Literal(literal)); }
+                return Self::Parts(FilePath::new(parts));
+            }
+        }
+        // Conservatively extract literal fragments, preserving unknown expressions.
+        // Do not mistake option strings such as sep="_" for filename evidence.
+        let fragments = ordered_literals(source);
+        if fragments.is_empty() { return Self::Unknown; }
+        let mut parts = vec![PathPart::Wildcard];
+        for fragment in fragments {
+            parts.push(PathPart::Literal(fragment));
+            parts.push(PathPart::Wildcard);
+        }
+        Self::Parts(FilePath::new(parts))
+    }
+}
+
+// The single source of truth for variables across assignments and notebook cells.
+#[derive(Default)]
+struct Environment {
+    variables: HashMap<String, Variable>,
+}
+
+impl Environment {
+    fn assign(&mut self, name: &str, expression: &str, language: &str) {
+        let variable = Variable::from_script_slice(expression, self, language);
+        self.variables.insert(name.to_owned(), variable);
+    }
+
+    fn exact(&self, name: &str) -> Option<&str> {
+        match self.variables.get(name) {
+            Some(Variable::Exact(s)) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 fn direction(name: &str) -> &'static str {
     let lower = name.to_ascii_lowercase();
     let tokens: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).collect();
@@ -191,34 +353,39 @@ fn split_args(s: &str) -> Vec<String> {
     }
     out.push(s[start..].trim().to_string()); out
 }
-fn value(expr: &str, vars: &HashMap<String,String>) -> Option<String> {
+impl Variable {
+    fn resolve_exact(expr: &str, env: &Environment) -> Option<String> {
     let s=expr.trim();
-    if let Some(v)=vars.get(s) {return Some(v.clone());}
+    if let Some(v)=env.exact(s) {return Some(v.to_owned());}
     if s.len()>=2 && ((s.starts_with('"')&&s.ends_with('"'))||(s.starts_with('\'')&&s.ends_with('\''))) {
         return Some(s[1..s.len()-1].to_string());
     }
     if (s.starts_with("f\"") && s.ends_with('"')) || (s.starts_with("f'") && s.ends_with('\'')) {
         if s.len() < 3 { return None; }
         let mut result=s[2..s.len()-1].to_string();
-        for (k,v) in vars {result=result.replace(&format!("{{{k}}}"),v);}
+        for (k,v) in &env.variables {
+            if let Variable::Exact(exact) = v { result=result.replace(&format!("{{{k}}}"),exact); }
+        }
         if !result.contains('{') {return Some(result);} return None;
     }
     for prefix in ["os.path.join(","file.path(","Path(","pathlib.Path("] {
         if let Some(rest)=s.strip_prefix(prefix).and_then(|x|x.strip_suffix(')')) {
-            let parts=split_args(rest); let vals=parts.iter().map(|p|value(p,vars)).collect::<Option<Vec<_>>>()?;
+            let parts=split_args(rest); let vals=parts.iter().map(|p|Self::resolve_exact(p,env)).collect::<Option<Vec<_>>>()?;
             if prefix.ends_with("Path(") {return vals.into_iter().next();}
             let mut path=std::path::PathBuf::new(); for v in vals {path.push(v);} return Some(normalized(&path));
         }
     }
     if s.contains(" / ") || s.contains(" + ") {
         let separator=if s.contains(" / ") {" / "} else {" + "};
-        let vals=s.split(separator).map(|x|value(x,vars)).collect::<Option<Vec<_>>>()?;
+        let vals=s.split(separator).map(|x|Self::resolve_exact(x,env)).collect::<Option<Vec<_>>>()?;
         return Some(if separator==" / " {vals.join("/")} else {vals.concat()});
     }
     None
 }
-fn match_candidate(db:&Connection, rel:&str, line:usize, expr:&str, label:&str, vars:&HashMap<String,String>, paths:&HashSet<String>, malformed:bool) -> Result<usize> {
-    let Some(v)=value(expr,vars) else {return Ok(0)};
+}
+
+fn match_candidate(db:&Connection, rel:&str, line:usize, expr:&str, label:&str, env:&Environment, paths:&HashSet<String>, malformed:bool) -> Result<usize> {
+    let Some(v)=Variable::resolve_exact(expr,env) else {return Ok(0)};
     let (resolved,external,ambiguous)=resolve_reference(&v,rel,paths);
     let filename=reference_name(&v);
     if external {record_issue(db,rel,line,&filename,"external")?;}
@@ -289,7 +456,7 @@ fn canonical(label: &str, imports: &HashMap<String, String>) -> String {
 }
 fn plot_outputs(
     db: &Connection, rel: &str, line: usize, canonical_call: &str,
-    args: &str, vars: &HashMap<String, String>, paths: &HashSet<String>,
+    args: &str, env: &Environment, paths: &HashSet<String>,
     plots: &[PlotRule],
 ) -> Result<usize> {
     let mut count = 0;
@@ -303,14 +470,14 @@ fn plot_outputs(
         if save_expr == "False" || save_expr == "None" { continue; }
         let suffix = if save_expr == "True" {
             String::new()
-        } else if let Some(v) = value(&save_expr, vars) {
+        } else if let Some(v) = Variable::resolve_exact(&save_expr, env) {
             if v.is_empty() { continue; }
             v
         } else { continue };
-        let directory = vars.get(&rule.directory_setting)
-            .cloned().unwrap_or_else(|| rule.default_directory.clone());
-        let format = vars.get(&rule.format_setting)
-            .cloned().unwrap_or_else(|| rule.default_format.clone());
+        let directory = env.exact(&rule.directory_setting)
+            .map(str::to_owned).unwrap_or_else(|| rule.default_directory.clone());
+        let format = env.exact(&rule.format_setting)
+            .map(str::to_owned).unwrap_or_else(|| rule.default_format.clone());
         let prefix = rule.prefix_overrides.get(function).map(String::as_str).unwrap_or(function);
         let suffix = if suffix.rsplit('/').next().unwrap_or("").contains('.') {
             suffix
@@ -382,7 +549,7 @@ fn argument_end(s:&str)->(usize,bool) {
     }
     (s.len(),false)
 }
-fn filename_args(label:&str, s:&str, vars:&HashMap<String,String>)->Vec<(String,String)> {
+fn filename_args(label:&str, s:&str, env:&Environment)->Vec<(String,String)> {
     let mut found=Vec::new();
     let args=split_args(s);
     let lower=label.to_ascii_lowercase();
@@ -397,14 +564,14 @@ fn filename_args(label:&str, s:&str, vars:&HashMap<String,String>)->Vec<(String,
         // argument has different meanings. R writeH5AD(sce, filename) is similar.
         let positional_ok=first_positional && !(lower.ends_with("write.csv")||lower.ends_with("write.table")||lower.ends_with("writeh5ad") );
         let second_positional= !first_positional && (lower.ends_with("write.csv")||lower.ends_with("write.table")||lower.ends_with("writeh5ad"));
-        if (known || (key.is_none() && (positional_ok || second_positional))) && value(expr,vars).is_some() {
+        if (known || (key.is_none() && (positional_ok || second_positional))) && Variable::resolve_exact(expr,env).is_some() {
             found.push((expr.to_owned(),if known && direction(&name)!="references" {key.unwrap().to_owned()} else {label.to_owned()}));
         }
         // Scientific helper writers commonly take (data, output_directory).
         // Accept a second positional argument only when it resolves to an
         // existing directory, never an arbitrary string from options.
         if key.is_none() && !first_positional && direction(label)=="writes" {
-            if let Some(path)=value(expr,vars) {
+            if let Some(path)=Variable::resolve_exact(expr,env) {
                 if path.len()>0 && !path.contains('.') && !path.contains(' ') {
                     found.push((expr.to_owned(),label.to_owned()));
                 }
@@ -434,14 +601,6 @@ fn ordered_literals(expr: &str) -> Vec<String> {
     }
     result
 }
-fn ordered_fragment_match(name: &str, fragments: &[String]) -> bool {
-    let mut rest = name;
-    for fragment in fragments {
-        let Some(pos) = rest.find(fragment) else { return false; };
-        rest = &rest[pos + fragment.len()..];
-    }
-    true
-}
 fn file_expression(args: &str, label: &str) -> Option<String> {
     let parts = split_args(args);
     // Explicit file/path arguments are preferred; never scan unrelated
@@ -460,10 +619,10 @@ fn file_expression(args: &str, label: &str) -> Option<String> {
     positional.get(index).map(|s| s.trim().to_string())
 }
 fn fragment_candidates(db: &Connection, rel: &str, line: usize, label: &str,
-    args: &str, expressions: &HashMap<String,String>, paths: &HashSet<String>) -> Result<usize> {
+    args: &str, env: &Environment, paths: &HashSet<String>) -> Result<usize> {
     let Some(arg) = file_expression(args, label) else { return Ok(0); };
-    let expression = expressions.get(&arg).map(String::as_str).unwrap_or(&arg);
-    let fragments = ordered_literals(expression);
+    let variable = Variable::from_script_slice(&arg, env, "");
+    let fragments = variable.clone().into_filepath().ordered_fragments();
     // Require either two substantial fragments or one distinctive filename
     // fragment. This deliberately avoids suggesting every *.tsv in a folder.
     if fragments.is_empty() || (fragments.len() == 1 && fragments[0].len() < 12) {
@@ -471,25 +630,29 @@ fn fragment_candidates(db: &Connection, rel: &str, line: usize, label: &str,
     }
     let mut matches: Vec<&String> = paths.iter().filter(|path| {
         let basename = path.rsplit('/').next().unwrap_or(path);
-        ordered_fragment_match(basename, &fragments)
+        variable.matches(basename)
     }).collect();
     matches.sort();
     // Cap candidate explosions: a broad match is not useful evidence.
     if matches.len() > 30 { return Ok(0); }
     let kind = match direction(label) {
-        "writes" => "possible_output",
-        "reads" => "possible_input",
+        "writes" => "writes",
+        "reads" => "reads",
         _ => return Ok(0),
     };
+    // A single loop-generated expression may legitimately produce several files.
+    // Record each inventory-backed match as an inferred relationship to this
+    // script/cell, not merely as an issue that Spectator cannot display.
     for path in &matches {
-        db.execute("INSERT OR IGNORE INTO issues(notebook,cell,filename,category,note)
-                    VALUES (?1,?2,?3,?4,?5)",
-            params![rel, line as i64, path, kind,
-                format!("Candidate via {label}({arg}); ordered fragments: {}", fragments.join(" | "))])?;
+        let evidence = format!(
+            "{rel}: cell/line {line}: inferred {kind} via {label}({arg}); symbolic fragments: {}",
+            fragments.join(" | ")
+        );
+        add_relation(db, rel, path, kind, &evidence, false)?;
     }
     Ok(matches.len())
 }
-fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule], language:&str)->Result<usize> {
+fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,env:&mut Environment,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule], language:&str)->Result<usize> {
     let assign=Regex::new(r#"^\s*(?:export\s+)?([A-Za-z_][\w.]*)\s*(?:<-|=)\s*(.*?)\s*$"#)?;
     let mut count=0;
     imports.extend(python_imports(source));
@@ -497,7 +660,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     // Assignments are tracked in source order, but unresolved assignments
     // invalidate earlier values rather than retaining stale provenance.
     let mut assignments:Vec<(usize,String,String)>=Vec::new();
-    let mut expressions:HashMap<String,String>=HashMap::new();
+    
     let mut offset=0;
     for line in source.lines() {
         if let Some(c)=assign.captures(line) {
@@ -509,8 +672,8 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     for (idx,(line,label,start)) in ops.iter().enumerate() {
         while ai<assignments.len() && assignments[ai].0<*start {
             let (_,name,expr)=&assignments[ai];
-            expressions.insert(name.clone(), expr.clone());
-            if let Some(v)=value(expr,vars){vars.insert(name.clone(),v);}else{vars.remove(name);}
+            env.assign(name, expr, language);
+
             ai+=1;
         }
         let remaining=&source[*start..];
@@ -525,18 +688,18 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
         let args=&remaining[..limit.min(remaining.len())];
         if balanced {
             if language != "r" {
-                count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, vars, paths, plots)?;
+                count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, env, paths, plots)?;
             }
             let name=if language == "r" { label.as_str() } else { label.rsplit('.').next().unwrap_or(label) };
             for rule in rules.iter().filter(|r|r.name==name && r.language==language) {
-                count+=apply_rule(db,rel,line_base+line-1,args,rule,vars,paths)?;
+                count+=apply_rule(db,rel,line_base+line-1,args,rule,env,paths)?;
             }
         }
-        let mut candidates=filename_args(label,args,vars);
+        let mut candidates=filename_args(label,args,env);
         // Only use the fragment fallback when the existing exact resolver
         // found no filename argument. Candidates stay in Build / Repair.
         if candidates.is_empty() && balanced {
-            fragment_candidates(db,rel,line_base+line-1,label,args,&expressions,paths)?;
+            fragment_candidates(db,rel,line_base+line-1,label,args,env,paths)?;
         }
         // A malformed call may have a complete filename literal followed by
         // another argument without a comma. Preserve that literal as evidence
@@ -552,7 +715,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
                         let literal=&trimmed[..offset+c.len_utf8()];
                         let tail=trimmed[offset+c.len_utf8()..].trim_start();
                         if (tail.is_empty() || tail.starts_with(',') || tail.contains('\n'))
-                            && value(literal,vars).is_some() {
+                            && Variable::resolve_exact(literal,env).is_some() {
                             candidates.push((literal.to_owned(),label.to_owned()));
                         }
                         break;
@@ -561,17 +724,17 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
             }
         }
         for (expr,hint) in &candidates {
-            let Some(path)=value(expr,vars) else {continue};
+            let Some(path)=Variable::resolve_exact(expr,env) else {continue};
             let (resolved,_,_)=resolve_reference(&path,rel,paths);
             if !balanced && resolved.is_none() {continue;}
-            count+=match_candidate(db,rel,line_base+line-1,expr,hint,vars,paths,!balanced)?;
+            count+=match_candidate(db,rel,line_base+line-1,expr,hint,env,paths,!balanced)?;
         }
         if label.to_ascii_lowercase().ends_with("read_10x_mtx") {
             if let Some((expr,_))=candidates.first() {
-                if let Some(dir)=value(expr,vars) {
+                if let Some(dir)=Variable::resolve_exact(expr,env) {
                     for name in ["matrix.mtx.gz","features.tsv.gz","barcodes.tsv.gz"] {
                         let path=format!("{dir}/{name}");
-                        count+=match_candidate(db,rel,line_base+line-1,&format!("'{path}'"),"read",vars,paths,!balanced)?;
+                        count+=match_candidate(db,rel,line_base+line-1,&format!("'{path}'"),"read",env,paths,!balanced)?;
                     }
                 }
             }
@@ -580,20 +743,128 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     // Assignments at the end of a cell still matter to subsequent cells.
     while ai<assignments.len() {
         let (_,name,expr)=&assignments[ai];
-        expressions.insert(name.clone(), expr.clone());
-        if let Some(v)=value(expr,vars){vars.insert(name.clone(),v);}else{vars.remove(name);}
+        env.assign(name, expr, language);
+
         ai+=1;
     }
     Ok(count)
 }
+// Expand only explicitly enumerated shell loop values. Dynamic loops remain
+// symbolic and must not be treated as confirmed writes.
+fn shell_loop_values(line: &str) -> Option<(String, Vec<String>)> {
+    let line = line.trim();
+    let rest = line.strip_prefix("for ")?;
+    let (name, values) = rest.split_once(" in ")?;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+        return None;
+    }
+    let values = values.trim().trim_end_matches("; do").trim_end_matches(" do").trim();
+    let items: Vec<String> = values.split_whitespace().map(str::to_owned).collect();
+    if items.is_empty() || items.len() > 30 || items.iter().any(|v| v.chars().any(|c| matches!(c, '$' | '`' | '*' | '?' | '{' | '}'))) {
+        return None;
+    }
+    Some((name.to_owned(), items))
+}
+
+fn shell_expand(text: &str, env: &Environment) -> Variable {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' { literal.push(ch); continue; }
+        let mut name = String::new();
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            for c in chars.by_ref() { if c == '}' { break; } name.push(c); }
+        } else {
+            while chars.peek().is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_') {
+                name.push(chars.next().unwrap());
+            }
+        }
+        if name.is_empty() { literal.push('$'); continue; }
+        if !literal.is_empty() { parts.push(PathPart::Literal(std::mem::take(&mut literal))); }
+        match env.variables.get(&name) {
+            Some(Variable::Exact(value)) => parts.push(PathPart::Literal(value.clone())),
+            Some(Variable::Parts(path)) => parts.extend(path.parts.iter().cloned()),
+            _ => parts.push(PathPart::Wildcard),
+        }
+    }
+    if !literal.is_empty() { parts.push(PathPart::Literal(literal)); }
+    Variable::Parts(FilePath::new(parts))
+}
+
 fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule],plots:&[PlotRule])->Result<usize> {
-    let mut vars=HashMap::new();let mut count=0;
+    let mut env=Environment::default();let mut count=0;
     if shell {
+        let mut loop_variable: Option<(String, Vec<String>)> = None;
         for (line,raw) in lines {
-            let tokens=shell_tokens(raw.trim());
+            let raw = raw.trim();
+            if let Some(values) = shell_loop_values(raw) {
+                loop_variable = Some(values);
+                continue;
+            }
+            if raw == "done" { loop_variable = None; continue; }
+            // A simple shell assignment can refer to an enumerated loop variable.
+            if let Some((name, value)) = raw.split_once('=') {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    let template = value.trim().trim_matches('"').trim_matches('\'');
+                    let variants: Vec<Option<String>> = match &loop_variable {
+                        Some((_, values)) => values.iter().cloned().map(Some).collect(),
+                        None => vec![None],
+                    };
+                    let mut resolved = Vec::new();
+                    for variant in variants {
+                        let mut local = Environment { variables: env.variables.clone() };
+                        if let (Some((loop_name, _)), Some(value)) = (&loop_variable, variant) {
+                            local.variables.insert(loop_name.clone(), Variable::Exact(value));
+                        }
+                        resolved.push(shell_expand(template, &local));
+                    }
+                    // Only preserve an exact value when all iterations agree.
+                    env.variables.insert(name.to_owned(), if resolved.len() == 1 {
+                        resolved.remove(0)
+                    } else { Variable::Unknown });
+                    // Explicit loop outputs are handled below by re-expanding
+                    // the assignment for each enumerated loop value.
+                    continue;
+                }
+            }
+            let tokens=shell_tokens(raw);
             if tokens.first().map(String::as_str)==Some("cp") && tokens.len()>=3 {
-                for src in &tokens[1..tokens.len()-1] {count+=match_candidate(db,rel,*line,&format!("'{src}'"),"read",&vars,paths,false)?;}
-                count+=match_candidate(db,rel,*line,&format!("'{}'",tokens.last().unwrap()),"write",&vars,paths,false)?;
+                for src in &tokens[1..tokens.len()-1] {count+=match_candidate(db,rel,*line,&format!("'{src}'"),"read",&env,paths,false)?;}
+                count+=match_candidate(db,rel,*line,&format!("'{}'",tokens.last().unwrap()),"write",&env,paths,false)?;
+            }
+            if let Some(op) = extract_shell(raw) {
+                for output in op.writes {
+                    let output = output.trim_matches('"').trim_matches('\'');
+                    if let Some((loop_name, values)) = &loop_variable {
+                        for value in values {
+                            let mut local = Environment { variables: env.variables.clone() };
+                            local.variables.insert(loop_name.clone(), Variable::Exact(value.clone()));
+                            // Re-evaluate the preceding assignment under this
+                            // iteration, rather than matching a broad wildcard.
+                            for (_, previous) in lines.iter().take_while(|(n, _)| n < line) {
+                                if let Some((name, expr)) = previous.trim().split_once('=') {
+                                    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                                        let expr = expr.trim().trim_matches('"').trim_matches('\'');
+                                        local.variables.insert(name.to_owned(), shell_expand(expr, &local));
+                                    }
+                                }
+                            }
+                            if let Variable::Parts(path) = shell_expand(output, &local) {
+                                for target in paths.iter().filter(|p| path.matches(p)) {
+                                    add_relation(db, rel, target, "writes", &format!("{rel}: line {line}: shell loop redirection"), false)?;
+                                    count += 1;
+                                }
+                            }
+                        }
+                    } else if let Variable::Parts(path) = shell_expand(output, &env) {
+                        for target in paths.iter().filter(|p| path.matches(p)) {
+                            add_relation(db, rel, target, "writes", &format!("{rel}: line {line}: shell redirection"), false)?;
+                            count += 1;
+                        }
+                    }
+                }
             }
         }
         return Ok(count)
@@ -601,7 +872,7 @@ fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<
     let mut source=String::new();
     for (_,line) in lines {source.push_str(line);source.push('\n');}
     let language=if is_r_source(rel, &source) {"r"} else {"python"};
-    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules,&mut HashMap::new(),plots,language)?;
+    count+=analyze_source(db,rel,&source,1,paths,&mut env,rules,&mut HashMap::new(),plots,language)?;
     Ok(count)
 }
 // Notebook files are containers: the kernel, not .ipynb, determines syntax.
@@ -636,14 +907,14 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
     let content=std::fs::read_to_string(root.join(rel))?;
     if rel.ends_with(".ipynb") {
         let notebook:serde_json::Value=serde_json::from_str(&content)?;
-        let mut vars=HashMap::new();let mut imports=HashMap::new();let mut count=0;
+        let mut env=Environment::default();let mut imports=HashMap::new();let mut count=0;
         let default_language=notebook_language(&notebook);
         if let Some(cells)=notebook["cells"].as_array() {
             for (idx,cell) in cells.iter().enumerate() {
                 if cell["cell_type"]!="code" {continue;}
                 let src=if let Some(a)=cell["source"].as_array(){a.iter().filter_map(|v|v.as_str()).collect::<String>()}else{cell["source"].as_str().unwrap_or("").to_string()};
                 let language=cell_language(&src, default_language);
-                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules,&mut imports,&plots,language)?;
+                count+=analyze_source(db,rel,&src,idx+1,paths,&mut env,&rules,&mut imports,&plots,language)?;
             }
         }
         Ok(count)
@@ -656,11 +927,41 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
 
 #[cfg(test)] mod tests {
  use super::*;
+ #[test] fn symbolic_filepath_matches_and_normalizes() {
+     let path = FilePath::new(vec![PathPart::Literal("results/".into()),
+         PathPart::Literal("DESeq2_".into()), PathPart::Wildcard,
+         PathPart::Literal(".tsv".into())]);
+     assert!(path.matches("results/DESeq2_WT.tsv"));
+     assert!(path.matches("results/DESeq2_MUT.tsv"));
+     assert!(!path.matches("other/DESeq2_WT.tsv"));
+     assert!(!path.matches("results/DESeq2_WT.csv"));
+     assert_eq!(Variable::Exact("a.tsv".into()).into_filepath().parts,
+         vec![PathPart::Literal("a.tsv".into())]);
+ }
+ #[test] fn environment_resolves_assignments_in_order() {
+     let mut env = Environment::default();
+     env.assign("base", "'results'", "python");
+     env.assign("file", "os.path.join(base, 'first.tsv')", "python");
+     assert_eq!(env.exact("file"), Some("results/first.tsv"));
+     env.assign("file", "os.path.join(base, 'second.tsv')", "python");
+     assert_eq!(env.exact("file"), Some("results/second.tsv"));
+     env.assign("file", "paste0('DESeq2_', condition, '.tsv')", "r");
+     assert!(env.exact("file").is_none());
+     assert!(env.variables["file"].matches("DESeq2_WT.tsv"));
+ }
+
  #[test] fn ordered_fragments_are_language_neutral() {
      let pieces = ordered_literals(r#"paste(sep="_", "DESeq2_result", doi, "_condition_Cell.line.tsv")"#);
      assert_eq!(pieces, vec!["DESeq2_result", "_condition_Cell.line.tsv"]);
-     assert!(ordered_fragment_match("DESeq2_result_D1__condition_Cell.line.tsv", &pieces));
-     assert!(!ordered_fragment_match("_condition_Cell.line.tsv_DESeq2_result", &pieces));
+     let path = FilePath::new(vec![
+         PathPart::Wildcard,
+         PathPart::Literal(pieces[0].clone()),
+         PathPart::Wildcard,
+         PathPart::Literal(pieces[1].clone()),
+         PathPart::Wildcard,
+     ]);
+     assert!(path.matches("DESeq2_result_D1__condition_Cell.line.tsv"));
+     assert!(!path.matches("_condition_Cell.line.tsv_DESeq2_result"));
  }
 
  #[test] fn r_notebook_language_and_dotted_calls() {
@@ -701,28 +1002,28 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
  // Regression: malformed source code must never crash the provenance scanner.
  // This test is intentionally RED against the overnight-run implementation.
  #[test] fn malformed_fstrings_do_not_panic() {
-  let vars=HashMap::new();
+  let vars=Environment::default();
   for expression in ["f\"", "f'", "f\"unfinished", "f'unfinished", "f\"wrong'", "f'wrong\""] {
-   let outcome=std::panic::catch_unwind(|| value(expression,&vars));
+   let outcome=std::panic::catch_unwind(|| Variable::resolve_exact(expression,&vars));
    assert!(outcome.is_ok(), "parser panicked on {expression:?}");
    assert_eq!(outcome.unwrap(),None,"malformed f-string accepted: {expression:?}");
   }
  }
  #[test] fn value_handles_unicode_and_nested_argument_boundaries() {
-  let mut vars=HashMap::new();
-  vars.insert("base".into(),"data".into());
-  assert_eq!(value("f\"{base}/é.tsv\"",&vars).as_deref(),Some("data/é.tsv"));
+  let mut vars=Environment::default();
+  vars.assign("base", "'data'", "python");
+  assert_eq!(Variable::resolve_exact("f\"{base}/é.tsv\"",&vars).as_deref(),Some("data/é.tsv"));
   assert_eq!(split_args("'a,b', os.path.join('x', 'y'), 'é.tsv'"),
    vec!["'a,b'", "os.path.join('x', 'y')", "'é.tsv'"]);
  }
  #[test] fn variables_and_signals(){
-  let mut vars=HashMap::new();vars.insert("base".into(),"data".into());
-  assert_eq!(value("f\"{base}/a.h5ad\"",&vars).as_deref(),Some("data/a.h5ad"));
-  assert_eq!(value("os.path.join(base, 'a.h5ad')",&vars).as_deref(),Some("data/a.h5ad"));
+  let mut vars=Environment::default();vars.assign("base", "'data'", "python");
+  assert_eq!(Variable::resolve_exact("f\"{base}/a.h5ad\"",&vars).as_deref(),Some("data/a.h5ad"));
+  assert_eq!(Variable::resolve_exact("os.path.join(base, 'a.h5ad')",&vars).as_deref(),Some("data/a.h5ad"));
   assert_eq!(direction("write_my_fancy_super_duper_stats_tables"),"writes");
   assert_eq!(direction("thread_count"),"references");
   for malformed in ["f\"", "f'", "f", "f\"unterminated", "f'unterminated"] {
-   assert_eq!(value(malformed,&vars),None,"malformed expression: {malformed:?}");
+   assert_eq!(Variable::resolve_exact(malformed,&vars),None,"malformed expression: {malformed:?}");
   }
  }
 }
@@ -883,9 +1184,9 @@ mod bioinformatics_nasty_provenance_tests {
             "analysis/vr/database.sqlite", "analysis/vr/umap.mds",
             "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
         ].into_iter().map(str::to_owned).collect();
-        let mut vars = HashMap::new();
-        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules, &mut HashMap::new(), &[], "r")?;
-        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules, &mut HashMap::new(), &[], "python")?;
+        let mut env = Environment::default();
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut env, &rules, &mut HashMap::new(), &[], "r")?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut env, &rules, &mut HashMap::new(), &[], "python")?;
         let targets = db.prepare("SELECT target FROM relations")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
@@ -896,4 +1197,74 @@ mod bioinformatics_nasty_provenance_tests {
         Ok(())
     }
 
+}
+
+// Regression for real loop-generated filenames. These are deliberately end-to-end:
+// a matcher-only test would miss assignment and write-call extraction failures.
+#[cfg(test)]
+mod loop_generated_output_regressions {
+    use super::*;
+
+    const OUTPUTS: [&str; 3] = [
+        "DESeq2_result_D1__condition_Cell.line.tsv",
+        "DESeq2_result_D2__condition_Cell.line.tsv",
+        "DESeq2_result_D4__condition_Cell.line.tsv",
+    ];
+
+    fn verify_script(language: &str, source: &str) -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        schema(&db)?;
+        let paths: HashSet<String> = OUTPUTS.iter().map(|s| s.to_string()).collect();
+        let mut env = Environment::default();
+        analyze_source(&db, "analysis", source, 1, &paths, &mut env,
+            &[], &mut HashMap::new(), &[], language)?;
+        let mut stmt = db.prepare("SELECT target, kind, evidence FROM relations WHERE source='analysis'")?;
+        let links: Vec<(String, String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        for expected in OUTPUTS {
+            assert!(links.iter().any(|(path, kind, evidence)|
+                path == expected && kind == "writes" && evidence.contains("cell/line")),
+                "{language}: no recorded write relation for {expected}; relations={links:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r_paste_loop_write_table() -> Result<()> {
+        verify_script("r", r#"
+for (doi in names(table(samp2[,'Day.of.induction']))) {
+    tmpSamp = samp2[which(samp2[,'Day.of.induction'] == doi),]
+    fn = paste(sep="_", "DESeq2_result", doi, "_condition_Cell.line.tsv")
+    write.table(result, file=fn, quote=F, sep="\t", row.names=F)
+}
+"#)
+    }
+
+    #[test]
+    fn python_fstring_loop_write_csv() -> Result<()> {
+        verify_script("python", r#"
+for doi in days:
+    fn = f"DESeq2_result_{doi}__condition_Cell.line.tsv"
+    result.to_csv(fn, sep="\t", index=False)
+"#)
+    }
+
+    #[test]
+    fn bash_loop_redirect_outputs() -> Result<()> {
+        // Shell parsing has a separate entry point; this test must exercise it.
+        let db = Connection::open_in_memory()?;
+        schema(&db)?;
+        let paths: HashSet<String> = OUTPUTS.iter().map(|s| s.to_string()).collect();
+        let script = r#"for doi in D1 D2 D4; do
+  fn="DESeq2_result_${doi}__condition_Cell.line.tsv"
+  printf '%s\n' 'result' > "$fn"
+done"#;
+        let lines: Vec<(usize, String)> = script.lines().enumerate()
+            .map(|(i, line)| (i + 1, line.to_owned())).collect();
+        analyze_lines(&db, "analysis.sh", &lines, &paths, true, &[], &[])?;
+        let count: i64 = db.query_row(
+            "SELECT count(*) FROM relations WHERE kind='writes'", [], |r| r.get(0))?;
+        assert_eq!(count, 3, "Bash loop should identify all three output files");
+        Ok(())
+    }
 }

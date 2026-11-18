@@ -295,7 +295,7 @@ pub fn parse_notebook(db: &Connection, root: &Path, rel: &str, paths: &HashSet<S
 // Conservative extraction: these are *candidate* operations, not proof of execution.
 // Never persist original command strings: they may contain external paths or secrets.
 #[derive(Debug)]
-pub struct Operation { reads: Vec<String>, writes: Vec<String> }
+pub struct Operation { pub(crate) reads: Vec<String>, pub(crate) writes: Vec<String> }
 pub fn shell_tokens(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut word = String::new();
@@ -987,3 +987,4 @@ mod classification_integration_tests {
         assert_eq!(confirmed_roles(&db).unwrap().get("a/quant_res").map(String::as_str), Some("Quantification results"));
     }
 }
+

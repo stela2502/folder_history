@@ -4,7 +4,7 @@ use eframe::egui;
 //use regex::Regex;
 use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::process::Command;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver}};
 use std::path::{Path, PathBuf};
