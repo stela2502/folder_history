@@ -330,7 +330,7 @@ fn plot_outputs(
     Ok(count)
 }
 
-fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String>, plots:&[PlotRule])->Vec<(usize,String,usize)> {
+fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String>, plots:&[PlotRule], language:&str)->Vec<(usize,String,usize)> {
     let bytes=source.as_bytes(); let mut found=Vec::new();
     let mut i=0; let mut quote:Option<u8>=None; let mut escaped=false; let mut comment=false;
     while i<bytes.len() {
@@ -348,7 +348,7 @@ fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String
             while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i]==b'_' || bytes[i]==b'.') {i+=1;}
             let label=&source[start..i];
             let mut open=i;while open<bytes.len() && bytes[open].is_ascii_whitespace(){open+=1;}
-            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.name == label.rsplit('.').next().unwrap_or(label)) || plots.iter().any(|p| canonical(label, imports).starts_with(&(p.module.clone()+".")))) {
+            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.language == language && r.name == (if language == "r" {label} else {label.rsplit('.').next().unwrap_or(label)})) || plots.iter().any(|p| canonical(label, imports).starts_with(&(p.module.clone()+".")))) {
                 let line=source[..start].bytes().filter(|b|*b==b'\n').count()+1;
                 found.push((line,label.to_owned(),open+1));
             }
@@ -414,14 +414,90 @@ fn filename_args(label:&str, s:&str, vars:&HashMap<String,String>)->Vec<(String,
     }
     found
 }
-fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule])->Result<usize> {
+// A deliberately language-neutral fallback: literal fragments in a filename
+// expression must occur in order in an inventoried basename. No evaluation of
+// paste(), f-strings, loops, separators, or scientific functions.
+fn ordered_literals(expr: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut chars = expr.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' && c != '"' { continue; }
+        let mut literal = String::new();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(next) = chars.next() { literal.push(next); }
+            } else if ch == c { break; }
+            else { literal.push(ch); }
+        }
+        // Tiny fragments such as paste(sep="_") cannot identify a file.
+        if literal.len() >= 4 { result.push(literal); }
+    }
+    result
+}
+fn ordered_fragment_match(name: &str, fragments: &[String]) -> bool {
+    let mut rest = name;
+    for fragment in fragments {
+        let Some(pos) = rest.find(fragment) else { return false; };
+        rest = &rest[pos + fragment.len()..];
+    }
+    true
+}
+fn file_expression(args: &str, label: &str) -> Option<String> {
+    let parts = split_args(args);
+    // Explicit file/path arguments are preferred; never scan unrelated
+    // strings in a call (e.g. titles, columns, or plotting parameters).
+    for part in &parts {
+        if let Some((key, expression)) = part.split_once('=') {
+            if matches!(key.trim().to_ascii_lowercase().as_str(),
+                "file" | "filename" | "filepath" | "path" | "outfile" | "output_file" | "input_file") {
+                return Some(expression.trim().to_string());
+            }
+        }
+    }
+    let positional: Vec<&str> = parts.iter().filter(|p| !p.contains('=')).map(String::as_str).collect();
+    let lower = label.to_ascii_lowercase();
+    let index = if lower.ends_with("write.table") || lower.ends_with("write.csv") { 1 } else { 0 };
+    positional.get(index).map(|s| s.trim().to_string())
+}
+fn fragment_candidates(db: &Connection, rel: &str, line: usize, label: &str,
+    args: &str, expressions: &HashMap<String,String>, paths: &HashSet<String>) -> Result<usize> {
+    let Some(arg) = file_expression(args, label) else { return Ok(0); };
+    let expression = expressions.get(&arg).map(String::as_str).unwrap_or(&arg);
+    let fragments = ordered_literals(expression);
+    // Require either two substantial fragments or one distinctive filename
+    // fragment. This deliberately avoids suggesting every *.tsv in a folder.
+    if fragments.is_empty() || (fragments.len() == 1 && fragments[0].len() < 12) {
+        return Ok(0);
+    }
+    let mut matches: Vec<&String> = paths.iter().filter(|path| {
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        ordered_fragment_match(basename, &fragments)
+    }).collect();
+    matches.sort();
+    // Cap candidate explosions: a broad match is not useful evidence.
+    if matches.len() > 30 { return Ok(0); }
+    let kind = match direction(label) {
+        "writes" => "possible_output",
+        "reads" => "possible_input",
+        _ => return Ok(0),
+    };
+    for path in &matches {
+        db.execute("INSERT OR IGNORE INTO issues(notebook,cell,filename,category,note)
+                    VALUES (?1,?2,?3,?4,?5)",
+            params![rel, line as i64, path, kind,
+                format!("Candidate via {label}({arg}); ordered fragments: {}", fragments.join(" | "))])?;
+    }
+    Ok(matches.len())
+}
+fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,vars:&mut HashMap<String,String>,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule], language:&str)->Result<usize> {
     let assign=Regex::new(r#"^\s*(?:export\s+)?([A-Za-z_][\w.]*)\s*(?:<-|=)\s*(.*?)\s*$"#)?;
     let mut count=0;
     imports.extend(python_imports(source));
-    let ops=operations(source,rules,imports,plots);
+    let ops=operations(source,rules,imports,plots,language);
     // Assignments are tracked in source order, but unresolved assignments
     // invalidate earlier values rather than retaining stale provenance.
     let mut assignments:Vec<(usize,String,String)>=Vec::new();
+    let mut expressions:HashMap<String,String>=HashMap::new();
     let mut offset=0;
     for line in source.lines() {
         if let Some(c)=assign.captures(line) {
@@ -433,6 +509,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     for (idx,(line,label,start)) in ops.iter().enumerate() {
         while ai<assignments.len() && assignments[ai].0<*start {
             let (_,name,expr)=&assignments[ai];
+            expressions.insert(name.clone(), expr.clone());
             if let Some(v)=value(expr,vars){vars.insert(name.clone(),v);}else{vars.remove(name);}
             ai+=1;
         }
@@ -447,16 +524,20 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
         let limit=if !balanced {next.map_or(end,|n|end.min(n))}else{end};
         let args=&remaining[..limit.min(remaining.len())];
         if balanced {
-            if !rel.to_ascii_lowercase().ends_with(".r") {
+            if language != "r" {
                 count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, vars, paths, plots)?;
             }
-            let name=label.rsplit('.').next().unwrap_or(label);
-            let language=if rel.to_ascii_lowercase().ends_with(".r") {"r"} else {"python"};
-            for rule in rules.iter().filter(|r|r.name==name && (r.language==language || rel.ends_with(".ipynb"))) {
+            let name=if language == "r" { label.as_str() } else { label.rsplit('.').next().unwrap_or(label) };
+            for rule in rules.iter().filter(|r|r.name==name && r.language==language) {
                 count+=apply_rule(db,rel,line_base+line-1,args,rule,vars,paths)?;
             }
         }
         let mut candidates=filename_args(label,args,vars);
+        // Only use the fragment fallback when the existing exact resolver
+        // found no filename argument. Candidates stay in Build / Repair.
+        if candidates.is_empty() && balanced {
+            fragment_candidates(db,rel,line_base+line-1,label,args,&expressions,paths)?;
+        }
         // A malformed call may have a complete filename literal followed by
         // another argument without a comma. Preserve that literal as evidence
         // only when the call is incomplete and the referenced file exists.
@@ -499,6 +580,7 @@ fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&Has
     // Assignments at the end of a cell still matter to subsequent cells.
     while ai<assignments.len() {
         let (_,name,expr)=&assignments[ai];
+        expressions.insert(name.clone(), expr.clone());
         if let Some(v)=value(expr,vars){vars.insert(name.clone(),v);}else{vars.remove(name);}
         ai+=1;
     }
@@ -518,8 +600,35 @@ fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<
     }
     let mut source=String::new();
     for (_,line) in lines {source.push_str(line);source.push('\n');}
-    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules,&mut HashMap::new(),plots)?;
+    let language=if is_r_source(rel, &source) {"r"} else {"python"};
+    count+=analyze_source(db,rel,&source,1,paths,&mut vars,rules,&mut HashMap::new(),plots,language)?;
     Ok(count)
+}
+// Notebook files are containers: the kernel, not .ipynb, determines syntax.
+fn notebook_language(notebook: &serde_json::Value) -> &'static str {
+    for key in ["/metadata/kernelspec/language", "/metadata/language_info/name", "/metadata/kernelspec/name"] {
+        if let Some(value) = notebook.pointer(key).and_then(|v| v.as_str()) {
+            let name = value.to_ascii_lowercase();
+            if name == "r" || name == "ir" || name.starts_with("ir-") { return "r"; }
+            if name.contains("python") { return "python"; }
+        }
+    }
+    "unknown"
+}
+fn is_r_source(rel: &str, source: &str) -> bool {
+    let name = rel.to_ascii_lowercase();
+    if [".r", ".rmd", ".rscript"].iter().any(|ext| name.ends_with(ext)) { return true; }
+    let code = source.to_ascii_lowercase();
+    code.contains("library(") || code.contains("require(") || code.contains("<-")
+        || code.contains("read.table(") || code.contains("write.table(")
+}
+fn cell_language(source: &str, default: &'static str) -> &'static str {
+    let first = source.trim_start();
+    if first.starts_with("%%R") || first.starts_with("%%r\n") { "r" }
+    else if first.starts_with("%%python") || first.starts_with("%%bash") || first.starts_with("%%sh") { "python" }
+    else if default == "unknown" && is_r_source("", source) { "r" }
+    else if default == "unknown" { "python" }
+    else { default }
 }
 pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->Result<usize>{
     let rules=load_rules(root)?;
@@ -528,11 +637,13 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
     if rel.ends_with(".ipynb") {
         let notebook:serde_json::Value=serde_json::from_str(&content)?;
         let mut vars=HashMap::new();let mut imports=HashMap::new();let mut count=0;
+        let default_language=notebook_language(&notebook);
         if let Some(cells)=notebook["cells"].as_array() {
             for (idx,cell) in cells.iter().enumerate() {
                 if cell["cell_type"]!="code" {continue;}
                 let src=if let Some(a)=cell["source"].as_array(){a.iter().filter_map(|v|v.as_str()).collect::<String>()}else{cell["source"].as_str().unwrap_or("").to_string()};
-                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules,&mut imports,&plots)?;
+                let language=cell_language(&src, default_language);
+                count+=analyze_source(db,rel,&src,idx+1,paths,&mut vars,&rules,&mut imports,&plots,language)?;
             }
         }
         Ok(count)
@@ -545,6 +656,22 @@ pub(super) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
 
 #[cfg(test)] mod tests {
  use super::*;
+ #[test] fn ordered_fragments_are_language_neutral() {
+     let pieces = ordered_literals(r#"paste(sep="_", "DESeq2_result", doi, "_condition_Cell.line.tsv")"#);
+     assert_eq!(pieces, vec!["DESeq2_result", "_condition_Cell.line.tsv"]);
+     assert!(ordered_fragment_match("DESeq2_result_D1__condition_Cell.line.tsv", &pieces));
+     assert!(!ordered_fragment_match("_condition_Cell.line.tsv_DESeq2_result", &pieces));
+ }
+
+ #[test] fn r_notebook_language_and_dotted_calls() {
+     let notebook: serde_json::Value = serde_json::json!({"metadata":{"kernelspec":{"language":"R","name":"ir"}}});
+     assert_eq!(notebook_language(&notebook), "r");
+     assert_eq!(cell_language("write.table(x, file='out.tsv')", notebook_language(&notebook)), "r");
+     assert_eq!(cell_language("%%python\nprint(1)", "r"), "python");
+     assert!(is_r_source("script.R", "x <- 1"));
+     let ops=operations("read.table('in.tsv')\nwrite.table(x, file='out.tsv')", &[], &HashMap::new(), &[], "r");
+     assert_eq!(ops.iter().map(|(_, name, _)|name.as_str()).collect::<Vec<_>>(), vec!["read.table", "write.table"]);
+ }
  #[test] fn python_import_aliases_are_canonical() {
      let imports=python_imports("import scanpy as sc\nfrom scanpy import pl as plotting\nfrom scvelo.pl import velocity_embedding_stream as ves\n");
      assert_eq!(canonical("sc.pl.umap", &imports), "scanpy.pl.umap");
@@ -757,8 +884,8 @@ mod bioinformatics_nasty_provenance_tests {
             "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
         ].into_iter().map(str::to_owned).collect();
         let mut vars = HashMap::new();
-        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules, &mut HashMap::new(), &[])?;
-        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules, &mut HashMap::new(), &[])?;
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut vars, &rules, &mut HashMap::new(), &[], "r")?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut vars, &rules, &mut HashMap::new(), &[], "python")?;
         let targets = db.prepare("SELECT target FROM relations")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;

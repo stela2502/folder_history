@@ -248,194 +248,154 @@ fn provenance_step(path: &str, relations: &[Relation]) -> String {
 }
 
 
+// A script is a provenance actor, not a collection inferred from its filename.
+fn is_analysis_script(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".py", ".r", ".rmd", ".ipynb", ".sh", ".nf", ".rscript"]
+        .iter().any(|suffix| p.ends_with(suffix))
+}
+
+fn show_spectator_file(
+    ui: &mut egui::Ui,
+    path: &str,
+    by_path: &HashMap<&str, &Artifact>,
+    relations: &[Relation],
+    selected: Option<i64>,
+    actions: &mut Vec<(String, Option<i64>, FileAction)>,
+) {
+    let Some(a) = by_path.get(path) else { return; };
+    let (color, _) = file_role(path, &a.kind, relations);
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    ui.horizontal(|ui| {
+        if let Some(action) = file::show(ui, filename, path, selected == Some(a.id), Some(color)) {
+            actions.push((path.to_owned(), Some(a.id), action));
+        }
+        if ui.small_button("Folder").on_hover_text("Open containing directory").clicked() {
+            actions.push((path.to_owned(), Some(a.id), FileAction::OpenParent));
+        }
+    });
+}
+
 impl App {
     pub(crate) fn show_spectator(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Scientific analyses · Spectator");
+        ui.label("Folder → scripts / notebooks → raw input, other input, output. Only recorded relationships attach files to scripts.");
+        ui.separator();
 
-                    ui.heading("Scientific analyses · Spectator");
-                    ui.label("Browse inferred groups → folders / possible samples → workflows → files. Double-click a filename to open it.");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("□ Input   ● Script   ▶ Results   ·   Colors show detailed file types below");
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::from_rgb(100,175,255), "● raw");
-                        ui.colored_label(egui::Color32::from_rgb(180,125,240), "● processing");
-                        ui.colored_label(egui::Color32::from_rgb(80,145,215), "● dataset");
-                        ui.colored_label(egui::Color32::from_rgb(245,105,105), "● analysis");
-                        ui.colored_label(egui::Color32::from_rgb(235,205,90), "● tables");
-                        ui.colored_label(egui::Color32::from_rgb(105,215,145), "● figures");
-                        ui.colored_label(egui::Color32::GRAY, "● references");
-                    });
-                    ui.separator();
-                    // Scientist confirmations are authoritative annotations, not guesses
-                    // from filename extensions. Keep source and path together: a relative
-                    // filename in one notebook must not annotate a namesake elsewhere.
-                    let confirmed: Vec<(String, String, String)> = self.db.as_ref()
-                        .and_then(|db| {
-                            let mut stmt = db.prepare("SELECT source,path,role FROM file_classifications WHERE confirmed=1 ORDER BY source,path").ok()?;
-                            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()?;
-                            Some(rows.flatten().collect())
-                        }).unwrap_or_default();
-                    let fastq_count = self.artifacts.iter().filter(|a| is_fastq(&a.path)).count();
-                    ui.label(format!("{} detected groups · {} indexed files · {} FASTQ files · {} confirmed classifications",
-                        self.analysis_groups.len(), self.artifacts.len(), fastq_count, confirmed.len()));
-                    if !confirmed.is_empty() {
-                        ui.collapsing(format!("✓ Scientist-confirmed files and folders ({})", confirmed.len()), |ui| {
-                            egui::Grid::new("confirmed_classifications_overview").striped(true).show(ui, |ui| {
-                                ui.strong("File / folder"); ui.strong("Classification"); ui.strong("Source script"); ui.end_row();
-                                for (source, path, role) in &confirmed {
-                                    ui.label(path).on_hover_text(path);
-                                    ui.strong(role);
-                                    ui.small(source);
-                                    ui.end_row();
+        let by_path: HashMap<&str, &Artifact> = self.artifacts.iter()
+            .map(|a| (a.path.as_str(), a)).collect();
+        let relations = &self.relations;
+        let mut pending: Vec<(String, Option<i64>, FileAction)> = Vec::new();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for group in &self.analysis_groups {
+                let title = self.group_names.get(&group.key)
+                    .map(String::as_str).unwrap_or(&group.suggested_name);
+                let paths: std::collections::HashSet<&str> = group.paths.iter().map(String::as_str).collect();
+                let issues = self.issues.iter().filter(|i|
+                    self.analysis_assignment.get(&i.notebook) == Some(&group.key)
+                        && i.decision == "open").count();
+                let fastqs: Vec<&str> = group.paths.iter().map(String::as_str)
+                    .filter(|p| is_fastq(p)).collect();
+                let mut fastq_dirs: BTreeMap<String, usize> = BTreeMap::new();
+                for path in &fastqs {
+                    let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    *fastq_dirs.entry(dir.to_owned()).or_default() += 1;
+                }
+                let mut scripts: Vec<&str> = group.paths.iter().map(String::as_str)
+                    .filter(|p| is_analysis_script(p)).collect();
+                scripts.sort_unstable();
+                scripts.dedup();
+                let mut assigned = std::collections::HashSet::new();
+                for script in &scripts { assigned.insert(*script); }
+                for r in relations {
+                    if scripts.contains(&r.source.as_str()) && paths.contains(r.target.as_str())
+                        && matches!(r.kind.as_str(), "reads" | "writes" | "writes_directory") {
+                        assigned.insert(r.target.as_str());
+                    }
+                }
+                let mut unassigned: Vec<&str> = group.paths.iter().map(String::as_str)
+                    .filter(|p| !assigned.contains(p) && !is_fastq(p)).collect();
+                unassigned.sort_unstable();
+                unassigned.dedup();
+
+                let header = format!("{title} · {} files · {issues} open issues · {} links",
+                    group.paths.len(), group.edge_count);
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(), ui.make_persistent_id(("spectator-folder-v2", &group.key)), false)
+                    .show_header(ui, |ui| {
+                        ui.label(header);
+                        if !fastqs.is_empty() {
+                            ui.menu_button(format!("{} FASTQ ▾", fastqs.len()), |ui| {
+                                ui.label("Open FASTQ containing directories:");
+                                for (dir, count) in &fastq_dirs {
+                                    let display = if dir.is_empty() { "." } else { dir.as_str() };
+                                    if ui.button(format!("{display} · {count} files")).clicked() {
+                                        pending.push((dir.clone(), None, FileAction::OpenParent));
+                                        ui.close();
+                                    }
+                                }
+                                if fastq_dirs.len() > 1 && ui.button("Open all directories").clicked() {
+                                    for dir in fastq_dirs.keys() {
+                                        pending.push((dir.clone(), None, FileAction::OpenParent));
+                                    }
+                                    ui.close();
                                 }
                             });
-                        });
-                    }
-                    // The authoritative role table is shared with the scanner and wizard.
-                    let confirmed_by_path = self.db.as_ref()
-                        .and_then(|db| engine::confirmed_roles(db).ok()).unwrap_or_default();
-                    let mut pending_file_actions: Vec<(String, Option<i64>, FileAction)> = Vec::new();
-                    let by_path: HashMap<&str, &Artifact> = self.artifacts.iter().map(|a| (a.path.as_str(), a)).collect();
-                    let links = &self.relations;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for group in &self.analysis_groups {
-                            let title = self.group_names.get(&group.key).map(String::as_str).unwrap_or(&group.suggested_name);
-                            let issues = self.issues.iter().filter(|i| self.analysis_assignment.get(&i.notebook)==Some(&group.key) && i.decision=="open").count();
-                            let fastqs = group.paths.iter().filter(|p| is_fastq(p)).count();
-                            let header = format!("{title} · {} files ({fastqs} FASTQ) · {issues} open issues · {} links", group.paths.len(), group.edge_count);
-                            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("analysis", &group.key)), false).show_header(ui, |ui| {
-                                ui.label(&header);
-                                role_summary(ui, group.paths.iter().map(String::as_str), &by_path, links);
-                            }).body(|ui| {
-                                ui.small(format!("Analysis group: {} · source hint: {}", group.key, group.source_hint));
-                                let mut experiments: BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<&str>>>>> = BTreeMap::new();
-                                for path in &group.paths {
-                                    let Some(a) = by_path.get(path.as_str()) else { continue; };
-                                    let experiment = experiment_label(path, &group.suggested_name);
-                                    let sample = sample_label(path, &experiment);
-                                    let workflow = workflow_label(path, &a.kind).to_owned();
-                                    let step = provenance_step(path, links);
-                                    experiments.entry(experiment).or_default().entry(sample).or_default()
-                                        .entry(workflow).or_default().entry(step).or_default().push(path);
+                        } else { ui.weak("0 FASTQ"); }
+                    }).body(|ui| {
+                        ui.label(format!("Scripts / notebooks · {}", scripts.len()));
+                        for script in scripts {
+                            let basename = script.rsplit('/').next().unwrap_or(script);
+                            let mut raw = Vec::new();
+                            let mut input = Vec::new();
+                            let mut output = Vec::new();
+                            for r in relations.iter().filter(|r| r.source == script && by_path.contains_key(r.target.as_str())) {
+                                match r.kind.as_str() {
+                                    "reads" if is_fastq(&r.target) => raw.push(r.target.as_str()),
+                                    "reads" => input.push(r.target.as_str()),
+                                    "writes" | "writes_directory" => output.push(r.target.as_str()),
+                                    _ => {}
                                 }
-                                for (experiment, samples) in experiments {
-                                    let experiment_count: usize = samples.values().flat_map(|w| w.values()).flat_map(|s| s.values()).map(Vec::len).sum();
-                                    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("experiment", &experiment)), false).show_header(ui, |ui| {
-                                        ui.label(format!("🧬 {experiment} · {experiment_count} files"));
-                                        role_summary(ui, samples.values().flat_map(|w| w.values()).flat_map(|s| s.values()).flat_map(|paths| paths.iter().copied()), &by_path, links);
-                                    }).body(|ui| {
-                                        for (sample, workflows) in samples {
-                                            let sample_count: usize = workflows.values().flat_map(|s| s.values()).map(Vec::len).sum();
-                                            let sample_fastqs = workflows.values().flat_map(|s| s.values()).flat_map(|paths| paths.iter()).filter(|p| is_fastq(p)).count();
-                                            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("sample", &sample)), false).show_header(ui, |ui| {
-                                                {
-                                                    let script = workflows.get("Scripts and notebooks")
-                                                        .and_then(|steps| steps.values().flatten().copied().find(|path| {
-                                                            path.rsplit('/').next() == Some(sample.as_str())
-                                                        }));
-                                                    if let Some(path) = script {
-                                                        ui.label("File / collection:");
-                                                        // First visible filename is actionable; the adjacent button
-                                                        // is a reliable alternative to double-click in a collapsing header.
-                                                        if let Some(action) = file::show(ui, &sample, path, false, None) {
-                                                            pending_file_actions.push((path.to_owned(), None, action));
-                                                        }
-                                                        if ui.small_button("Open").on_hover_text("Open with default application").clicked() {
-                                                            pending_file_actions.push((path.to_owned(), None, FileAction::Open));
-                                                        }
-                                                        ui.label(format!("· {sample_count} files · {sample_fastqs} FASTQ"));
-                                                    } else {
-                                                        ui.label(format!("{} · {sample_count} files · {sample_fastqs} FASTQ", display_sample_label(&sample)));
-                                                    }
-                                                }
-                                                role_summary(ui, workflows.values().flat_map(|s| s.values()).flat_map(|paths| paths.iter().copied()), &by_path, links);
-                                            }).body(|ui| {
-                                                for (workflow, steps) in workflows {
-                                                    let workflow_count: usize = steps.values().map(Vec::len).sum();
-                                                    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("workflow", &workflow)), false).show_header(ui, |ui| {
-                                                        ui.label(format!("{workflow} · {workflow_count}"));
-                                                        role_summary(ui, steps.values().flat_map(|paths| paths.iter().copied()), &by_path, links);
-                                                    }).body(|ui| {
-                                                        for (step, paths) in steps {
-                                                            let path_count = paths.len();
-                                                            let is_script_step = workflow == "Scripts and notebooks";
-                                                            let mut render_files = |ui: &mut egui::Ui| {
-                                                                if step.starts_with("FASTQ library:") {
-                                                                    let sources = fastq_source_folders(&paths);
-                                                                    ui.label(format!("{} FASTQ files · {} physical folder cluster(s)", paths.len(), sources.len()));
-                                                                    for (dir, count) in &sources {
-                                                                        ui.horizontal_wrapped(|ui| {
-                                                                            ui.label(format!("📁 {dir} · {count} files"));
-                                                                            if ui.small_button("Open in file explorer").clicked() {
-                                                                                pending_file_actions.push((dir.to_owned(), None, FileAction::OpenParent));
-                                                                            }
-                                                                        });
-                                                                    }
-                                                                    ui.collapsing(format!("📋 Show FASTQ file list ({} files)", paths.len()), |ui| {
-                                                                        for path in &paths {
-                                                                            let filename = path.rsplit('/').next().unwrap_or(path);
-                                                                            ui.label(format!("{filename} — {path}")).on_hover_text(*path);
-                                                                        }
-                                                                    });
-                                                                    ui.separator();
-                                                                }
-                                                                for path in &paths {
-                                                                    let Some(a) = by_path.get(path) else { continue; };
-                                                                    let (mut color, _role) = file_role(&a.path, &a.kind, links);
-                                                                    if let Some(role) = confirmed_by_path.get(a.path.as_str()) {
-                                                                        color = match role.as_str() {
-                                                                            "Input data" | "Intermediate raw data" => egui::Color32::from_rgb(100,175,255),
-                                                                            "Preprocessed data" | "Quantification results" => egui::Color32::from_rgb(80,145,215),
-                                                                            "Analyzed data" | "Results folder" => egui::Color32::from_rgb(245,105,105),
-                                                                            _ => color,
-                                                                        };
-                                                                    }
-                                                                    let basename = a.path.rsplit('/').next().unwrap_or(&a.path);
-                                                                    if let Some(role) = confirmed_by_path.get(a.path.as_str()) {
-                                                                        ui.strong(format!("✓ {role}"));
-                                                                    }
-                                                                    if let Some(action) = file::show(ui, basename, &a.path, self.selected == Some(a.id), Some(color)) {
-                                                                        pending_file_actions.push((a.path.clone(), Some(a.id), action));
-                                                                    }
-                                                                    if self.selected==Some(a.id) {
-                                                                        ui.small(&a.path);
-                                                                        if ui.small_button("📂 Open containing folder").clicked() {
-                                                                            pending_file_actions.push((a.path.clone(), Some(a.id), FileAction::OpenParent));
-                                                                        }
-                                                                        let mut shown = std::collections::HashSet::new();
-                                                                        for r in links.iter().filter(|r| r.source==a.path || r.target==a.path) {
-                                                                            let other = if r.source==a.path { &r.target } else { &r.source };
-                                                                            let direction = if r.source==a.path { "→" } else { "←" };
-                                                                            if !shown.insert((direction, r.kind.as_str(), other.as_str())) { continue; }
-                                                                            if shown.len() > 30 { break; }
-                                                                            let name = other.rsplit('/').next().unwrap_or(other);
-                                                                            ui.small(format!("{direction} {} · {name}", r.kind)).on_hover_text(other);
-                                                                        }
-                                                                        if ui.small_button("Explore relationships").clicked() { self.tab=Tab::Graph; }
-                                                                    }
-                                                                }
-                                                            };
-                                                            if is_script_step {
-                                                                render_files(ui);
-                                                            } else {
-                                                                egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("step", &step)), false).show_header(ui, |ui| {
-                                                                    ui.label(format!("{step} · {path_count}"));
-                                                                    role_summary(ui, paths.iter().copied(), &by_path, links);
-                                                                }).body(render_files);
-                                                            }
-                                                        }
-                                                    });
-                                                }
-                                            });
-                                        }
-                                    });
+                            }
+                            for items in [&mut raw, &mut input, &mut output] {
+                                items.sort_unstable();
+                                items.dedup();
+                            }
+                            let id = ui.make_persistent_id(("spectator-script-v2", script));
+                            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                                .show_header(ui, |ui| {
+                                    ui.label(format!("{basename} · {} raw · {} input · {} output",
+                                        raw.len(), input.len(), output.len())).on_hover_text(script);
+                                    if ui.small_button("Open").clicked() {
+                                        pending.push((script.to_owned(), by_path.get(script).map(|a| a.id), FileAction::Open));
+                                    }
+                                }).body(|ui| {
+                                    for (label, items) in [("Raw input", &raw), ("Other input", &input), ("Output", &output)] {
+                                        ui.collapsing(format!("{label} · {}", items.len()), |ui| {
+                                            for path in items {
+                                                show_spectator_file(ui, path, &by_path, relations,
+                                                    self.selected, &mut pending);
+                                            }
+                                        });
+                                    }
+                                    if raw.is_empty() && input.is_empty() && output.is_empty() {
+                                        ui.weak("No recorded file relationships — inspect or resolve provenance.");
+                                    }
+                                });
+                        }
+                        if !unassigned.is_empty() {
+                            ui.collapsing(format!("Unassigned files · {}", unassigned.len()), |ui| {
+                                for path in unassigned {
+                                    show_spectator_file(ui, path, &by_path, relations,
+                                        self.selected, &mut pending);
                                 }
                             });
                         }
                     });
-                    // Apply UI events only after all immutable artifact/group borrows end.
-                    for (path, id, action) in pending_file_actions {
-                        apply_file_action(self, ui, &path, id, action);
-                    }
-                    }
+            }
+        });
+        for (path, id, action) in pending {
+            apply_file_action(self, ui, &path, id, action);
+        }
+    }
 }

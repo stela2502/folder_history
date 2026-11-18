@@ -363,10 +363,20 @@ impl App {
             publish_archive_snapshot(&snapshot, &archive)?;
             Ok(())
         })();
-        let _ = std::fs::remove_file(&snapshot);
         match result {
-            Ok(()) => self.status = "Published local SQLite snapshot to archive.".into(),
-            Err(e) => self.status = format!("Publication failed; local working database retained: {e:#}"),
+            Ok(()) => {
+                let _ = std::fs::remove_file(&snapshot);
+                self.status = "Published local SQLite snapshot to archive.".into();
+            }
+            Err(e) => {
+                // Keep the standalone VACUUM snapshot for manual transfer.
+                let archive = local_index_path(root);
+                self.status = if snapshot.is_file() {
+                    format!("Publication failed: {e:#} | Recovery SQLite snapshot: {} | Intended destination: {} | Local working DB: {}", snapshot.display(), archive.display(), local.display())
+                } else {
+                    format!("Publication failed: {e:#} | No recovery snapshot created. Local working DB: {} | Intended destination: {}", local.display(), archive.display())
+                };
+            }
         }
     }
     pub(crate) fn begin_scan(&mut self) {

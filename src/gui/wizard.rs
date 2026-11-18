@@ -5,13 +5,6 @@ use super::app::{App, open_indexed_file};
 #[derive(Clone)]
 struct Candidate { path: String, variable: String, folder: bool }
 
-fn is_figure(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".svg", ".pdf", ".tif", ".tiff", ".eps", ".gif", ".webp"]
-        .iter().any(|suffix| lower.ends_with(suffix))
-        || lower.split('/').any(|part| matches!(part, "figures" | "figure" | "plots" | "images"))
-}
-
 fn looks_like_path(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_control)
         && !matches!(value, "\\t" | "\\n" | "\\r") && !value.contains("://")
@@ -29,14 +22,14 @@ fn assignment(line: &str) -> Option<(String, String)> {
     let quote = rhs.chars().next()?;
     if quote != '\'' && quote != '"' { return None; }
     let value = rhs[1..].split(quote).next()?;
-    if !looks_like_path(value) || is_figure(value) { return None; }
+    if !looks_like_path(value) { return None; }
     Some((lhs.to_owned(), value.to_owned()))
 }
 
 fn candidates(root: &Path, source: &str, issues: &[Issue]) -> Vec<Candidate> {
     let mut found: BTreeMap<String, Candidate> = BTreeMap::new();
     for issue in issues {
-        if issue.notebook != source || is_figure(&issue.filename) { continue; }
+        if issue.notebook != source { continue; }
         let path = issue.filename.clone();
         found.entry(path.clone()).or_insert(Candidate {
             folder: Path::new(&path).extension().is_none(), path, variable: String::new(),
@@ -106,10 +99,15 @@ fn suggestion(variable: &str) -> &'static str {
     }
 }
 
+// Existing labels remain selectable so saved classifications are not lost.
 const ROLES: &[&str] = &[
-    "Unknown", "Input data", "Other Input Files", "Intermediate raw data", "Preprocessed data",
-    "Analyzed data", "Quantification results", "Results folder",
-    "Other scientific data", "Not relevant",
+    "Unknown",
+    "Raw experimental data", "Processed data", "Sample metadata",
+    "Reference data", "Configuration / parameters", "Result files",
+    "Results folder", "Figures & images", "Other scientific data", "Not relevant",
+    // Legacy labels retained for existing databases.
+    "Input data", "Other Input Files", "Intermediate raw data",
+    "Preprocessed data", "Analyzed data", "Quantification results",
 ];
 
 // Apply a chosen classification to every candidate in this script.
@@ -144,10 +142,26 @@ impl App {
                 }
             }
         }
+        // Resolve each reference to a unique indexed artifact and reuse its
+        // confirmed role, regardless of which notebook is being investigated.
+        // A matching basename alone is not sufficient when paths are ambiguous.
+        let shared_roles = self.db.as_ref().and_then(|db| {
+            let mut stmt = db.prepare("SELECT path FROM artifacts").ok()?;
+            let paths = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?
+                .collect::<rusqlite::Result<HashSet<_>>>().ok()?;
+            let roles = engine::confirmed_roles(db).ok()?;
+            Some((paths, roles))
+        });
         for item in &items {
             let key = format!("{source}\0{}", item.path);
-            self.classification_choices.entry(key).or_insert_with(|| saved.get(&item.path)
-                .cloned().unwrap_or_else(|| suggestion(&item.variable).to_owned()));
+            let shared = shared_roles.as_ref().and_then(|(paths, roles)| {
+                let path = engine::classified_artifact_path(&item.path, &source, paths)?;
+                roles.get(&path).cloned()
+            });
+            self.classification_choices.entry(key).or_insert_with(|| {
+                shared.or_else(|| saved.get(&item.path).cloned())
+                    .unwrap_or_else(|| suggestion(&item.variable).to_owned())
+            });
         }
         let unknown = items.iter().filter(|item| {
             self.classification_choices.get(&format!("{source}\0{}", item.path))
@@ -171,51 +185,59 @@ impl App {
             });
         });
         ui.add_space(12.0);
+        // A horizontal layout gives the frame its natural content width,
+        // instead of stretching it to the table or available window width.
         ui.horizontal(|ui| {
-            ui.add_space(14.0);
             egui::Frame::new()
                 .fill(egui::Color32::from_gray(38))
                 .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(58)))
                 .corner_radius(egui::CornerRadius::same(6))
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
+                    // Keep selection and classification as two distinct rows.
+                    // The outer horizontal layout lets the frame hug its contents.
+                    ui.vertical(|ui| {
                     ui.strong("Bulk classification");
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Select all").clicked() {
-                for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), true); }
-            }
-            if ui.button("Select none").clicked() {
-                for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), false); }
-            }
-            if ui.button("Invert selection").clicked() {
-                for item in &items {
-                    let key = format!("{source}\0{}", item.path);
-                    let current = self.classification_selected.get(&key).copied().unwrap_or(true);
-                    self.classification_selected.insert(key, !current);
-                }
-            }
-            let selected = items.iter().filter(|item| self.classification_selected.get(&format!("{source}\0{}", item.path)).copied().unwrap_or(true)).count();
-            ui.label(format!("{selected}/{} selected", items.len()));
-        });
-        ui.horizontal(|ui| {
-            ui.strong("Set selected files/folders to:");
-            egui::ComboBox::from_id_salt("bulk_file_role")
-                .selected_text("Choose classification…")
-                .show_ui(ui, |ui| {
-                    for role in ROLES.iter().copied().filter(|role| *role != "Unknown") {
-                        if ui.selectable_label(false, role).clicked() {
+                            for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), true); }
+                        }
+                        if ui.button("Select none").clicked() {
+                            for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), false); }
+                        }
+                        if ui.button("Invert selection").clicked() {
                             for item in &items {
                                 let key = format!("{source}\0{}", item.path);
-                                if self.classification_selected.get(&key).copied().unwrap_or(true) {
-                                    self.classification_choices.insert(key, role.to_owned());
-                                }
+                                let current = self.classification_selected.get(&key).copied().unwrap_or(true);
+                                self.classification_selected.insert(key, !current);
                             }
                         }
-                    }
-                });
-            ui.small("Applies to checked rows only; edit individual rows afterwards.");
-        });
+                        let selected_count = items.iter().filter(|item| self.classification_selected.get(&format!("{source}\0{}", item.path)).copied().unwrap_or(true)).count();
+                        ui.label(format!("{selected_count}/{} selected", items.len()));
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                    ui.label("Set selected files/folders to:");
+                    egui::ComboBox::from_id_salt("bulk_file_role")
+                        .selected_text("Choose classification…")
+                        .show_ui(ui, |ui| {
+                            for role in ROLES.iter().copied().filter(|role| *role != "Unknown") {
+                                if ui.selectable_label(false, role).clicked() {
+                                    for item in &items {
+                                        let key = format!("{source}\0{}", item.path);
+                                        if self.classification_selected.get(&key).copied().unwrap_or(true) {
+                                            self.classification_choices.insert(key, role.to_owned());
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.small("Applies to checked rows only; edit individual rows afterwards.");
+                    });
                 });
         });
         ui.add_space(10.0);
@@ -281,7 +303,10 @@ impl App {
                         self.wizard_mode = false;
                         self.active_dependency = None;
                         ui.ctx().request_repaint();
-                        self.issue_filter = "resolved".to_owned();
+                        // Keep the user's current Build / Repair category.
+                        // Discard cached wizard choices so shared confirmed roles
+                        // are loaded afresh when another notebook is opened.
+                        self.classification_choices.clear();
                         self.recently_confirmed = Some((source.clone(), selected.clone()));
                         self.refresh();
                         self.publish();
@@ -297,7 +322,7 @@ impl App {
             if unknown > 0 { ui.label("Classify all unknown entries to confirm."); }
         });
         ui.label(&self.status);
-        ui.small("Figures are excluded. Suggestions are editable; confirming does not create global YAML rules.");
+        ui.small("Figures can be classified. Suggestions are editable; confirming does not create global YAML rules.");
     }
 }
 
@@ -318,6 +343,13 @@ mod tests {
         assert!(choices.values().all(|role| role == "Other Input Files"));
     }
     #[test]
+    fn classification_labels_include_new_and_legacy_values() {
+        for role in ["Sample metadata", "Reference data", "Result files", "Figures & images",
+                     "Input data", "Analyzed data", "Quantification results"] {
+            assert!(ROLES.contains(&role), "missing role: {role}");
+        }
+    }
+    #[test]
     fn folder_path_matches_prefixed_issue() {
         assert!(matches_issue_path("Local/OMIX236-20/Isabella_OMIX236", "Isabella_OMIX236"));
         assert!(matches_issue_path("data/quant_res/", "data/quant_res"));
@@ -327,7 +359,8 @@ mod tests {
     fn simple_assignments_and_figures() {
         assert_eq!(assignment("analyzed = \"sample_analyzed.h5ad\""), Some(("analyzed".into(), "sample_analyzed.h5ad".into())));
         assert_eq!(assignment("raw = 'sample_raw.h5ad'"), Some(("raw".into(), "sample_raw.h5ad".into())));
-        assert!(assignment("plot = 'figures/plot.png'").is_none());
+        assert_eq!(assignment("plot = 'figures/plot.png'"),
+            Some(("plot".into(), "figures/plot.png".into())));
         assert!(assignment("x = 42").is_none());
         assert!(assignment("sep = '\\t'").is_none());
         assert!(assignment("sep = '\t'").is_none());
