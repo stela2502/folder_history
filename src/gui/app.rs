@@ -91,6 +91,28 @@ pub(crate) fn issue_analysis_candidates(
 }
 
 
+// Inventory-only FASTQ summary: never create provenance edges from directory membership.
+pub(crate) fn is_fastq_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    [".fastq", ".fastq.gz", ".fq", ".fq.gz"].iter().any(|ext| p.ends_with(ext))
+}
+
+// Keep independently located FASTQ trees separate, but collapse sibling sets
+// such as data/set1 and data/set2 to their shared data/ parent.
+pub(crate) fn fastq_folders(paths: &[String]) -> Vec<(String, usize)> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for path in paths {
+        let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+        let parts: Vec<_> = parent.components().collect();
+        let folder = if parts.len() >= 2 {
+            // First meaningful directory is a stable grouping within an analysis.
+            parts[0].as_os_str().to_string_lossy().to_string()
+        } else { parent.to_string_lossy().to_string() };
+        *counts.entry(folder).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
 pub(crate) enum ScanEvent { Progress(String), Finished(Result<ScanResult, String>), Resolved(Result<(i64, i64), String>) }
 
 pub(crate) struct App {
@@ -101,7 +123,7 @@ pub(crate) struct App {
     pub(crate) group_filter: String, pub(crate) group_names: HashMap<String, String>, pub(crate) group_name_edit: String,
     pub(crate) analysis_groups: Vec<analysis_graph::AnalysisGroup>, pub(crate) analysis_assignment: HashMap<String, String>,
     pub(crate) nav_history: Vec<NavState>, pub(crate) nav_cursor: usize,
-    pub(crate) recent_folders: Vec<PathBuf>, pub(crate) include_hidden: bool, missing_index: Option<PathBuf>, error_popup: Option<String>, pub(crate) open_events: Option<Receiver<App>>, pub(crate) scan_after_open: bool, pub(crate) scan_events: Option<Receiver<ScanEvent>>, pub(crate) scan_cancel: Option<Arc<AtomicBool>>,
+    pub(crate) recent_folders: Vec<PathBuf>, pub(crate) include_hidden: bool, missing_index: Option<PathBuf>, error_popup: Option<String>, pub(crate) open_events: Option<Receiver<App>>, open_cancel: Option<Arc<AtomicBool>>, pub(crate) scan_after_open: bool, pub(crate) scan_events: Option<Receiver<ScanEvent>>, pub(crate) scan_cancel: Option<Arc<AtomicBool>>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -113,7 +135,7 @@ impl Default for App {
             group_filter: String::new(), group_names: HashMap::new(), group_name_edit: String::new(),
             analysis_groups: Vec::new(), analysis_assignment: HashMap::new(),
             nav_history: vec![], nav_cursor: 0,
-            recent_folders: load_recent_folders(), include_hidden: false, missing_index: None, error_popup: None, open_events: None, scan_after_open: false, scan_events: None, scan_cancel: None }
+            recent_folders: load_recent_folders(), include_hidden: false, missing_index: None, error_popup: None, open_events: None, open_cancel: None, scan_after_open: false, scan_events: None, scan_cancel: None }
     }
 }
 
@@ -145,14 +167,16 @@ impl App {
         if self.open_events.is_some() || self.scan_events.is_some() { return; }
         let (tx, rx) = mpsc::channel();
         self.open_events = Some(rx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.open_cancel = Some(Arc::clone(&cancel));
         self.missing_index = None;
         self.scan_after_open = analyze;
         self.status = format!("Loading archive {}…", root.display());
         std::thread::spawn(move || {
             // SQLite reads and analysis-group construction must never block egui.
             let mut loaded = App::default();
-            loaded.open_sync(root, analyze);
-            let _ = tx.send(loaded);
+            loaded.open_sync(root, analyze, &cancel);
+            if !cancel.load(Ordering::Relaxed) { let _ = tx.send(loaded); }
         });
     }
 
@@ -160,6 +184,7 @@ impl App {
         let result = self.open_events.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(mut loaded) = result {
             self.open_events = None;
+            self.open_cancel = None;
             if loaded.db.is_none() {
                 self.missing_index = loaded.missing_index.take();
                 self.scan_after_open = false;
@@ -195,16 +220,19 @@ impl App {
             }
         } else if self.open_events.as_ref().is_some_and(|rx| matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))) {
             self.open_events = None;
+            self.open_cancel = None;
             self.scan_after_open = false;
             self.status = "Archive opening failed: background worker disconnected".into();
         }
     }
 
-    fn open_sync(&mut self, root: PathBuf, analyze: bool) {
+    fn open_sync(&mut self, root: PathBuf, analyze: bool, cancel: &AtomicBool) {
         let result: Result<(Connection, BatchWorkspace, PathBuf, PathBuf)> = (|| {
+            if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
             if !root.is_dir() { anyhow::bail!("Folder does not exist: {}", root.display()); }
             if analyze { probe_archive_write_access(&root)?; }
             let (workspace, local, archive, exists) = archive_working_copy(&root)?;
+            if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
             if !exists && !analyze {
                 self.missing_index = Some(root.clone());
                 anyhow::bail!("No FolderHistory database found in .folder_history/history.sqlite");
@@ -217,10 +245,12 @@ impl App {
             db.busy_timeout(std::time::Duration::from_secs(30))?;
             db.execute_batch("PRAGMA journal_mode=DELETE;")?;
             schema(&db)?;
+            if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
             Ok((db, workspace, local, archive))
         })();
         match result {
             Ok((db, workspace, local, archive)) => {
+                if cancel.load(Ordering::Relaxed) { return; }
                 self.recent_folders.retain(|p| p != &root);
                 self.recent_folders.insert(0, root.clone());
                 self.recent_folders.truncate(5);
@@ -232,6 +262,7 @@ impl App {
                 self.selected = None; self.active_dependency = None; self.group_filter.clear();
                 self.tab = if analyze { Tab::Build } else { Tab::Spectator };
                 self.refresh(); self.status = format!("Opened local copy of {}", archive.display());
+                if cancel.load(Ordering::Relaxed) { return; }
                 if !analyze { self.ensure_missing_html(); }
                 if let Some(e) = recent_save_error {
                     self.status.push_str(&format!(" (could not save recent folders: {e})"));
@@ -589,7 +620,26 @@ impl eframe::App for App {
 
             });
         });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| { ui.label(&self.status); });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if self.open_events.is_some() || self.scan_events.is_some() { ui.spinner(); }
+                ui.add(egui::Label::new(&self.status).truncate());
+                if self.open_events.is_some() || self.scan_cancel.is_some() {
+                    if ui.button("■ Stop").on_hover_text("Cancel archive opening or request scan cancellation").clicked() {
+                        if let Some(cancel) = self.open_cancel.take() {
+                            cancel.store(true, Ordering::Relaxed);
+                            // Detach a blocked filesystem worker; ignore its eventual result.
+                            self.open_events = None;
+                            self.scan_after_open = false;
+                            self.status = "Archive opening stopped; an in-flight filesystem call may still finish in the background.".into();
+                        } else if let Some(cancel) = &self.scan_cancel {
+                            cancel.store(true, Ordering::Relaxed);
+                            self.status = "Stopping scan; waiting for the current filesystem operation...".into();
+                        }
+                    }
+                }
+            });
+        });
         if let Some(message) = self.error_popup.clone() {
             egui::Window::new("⚠ FolderHistory operation failed")
                 .collapsible(false).resizable(true).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -775,6 +825,48 @@ impl eframe::App for App {
                             }
                         });
                     }
+                    // Show raw FASTQs regardless of whether the processing pipeline is archived.
+                    // The analysis filter prevents mixing independent research projects.
+                    let fastqs: Vec<String> = self.artifacts.iter()
+                        .filter(|a| is_fastq_path(&a.path))
+                        .filter(|a| self.group_filter.is_empty() || self.analysis_assignment.get(&a.path) == Some(&self.group_filter))
+                        .map(|a| a.path.clone()).collect();
+                    let fastq_count = fastqs.len();
+                    ui.collapsing(format!("FASTQs ({fastq_count})"), |ui| {
+                        for (folder, count) in fastq_folders(&fastqs) {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{folder}/ · {count} files"));
+                                if ui.small_button("📂 Open folder").clicked() {
+                                    if let Some(root) = &self.root {
+                                        if let Err(e) = reveal_in_file_manager(root, &folder) {
+                                            self.status = format!("Cannot open FASTQ folder: {e}");
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        // A complete path requires every FASTQ to reach an existing
+                        // non-FASTQ result through recorded relationships.
+                        let complete = !fastqs.is_empty() && fastqs.iter().all(|fq| {
+                            let mut visited = std::collections::HashSet::<String>::new();
+                            let mut pending = vec![fq.as_str()];
+                            let mut reaches_result = false;
+                            while let Some(current) = pending.pop() {
+                                if !visited.insert(current.to_owned()) { continue; }
+                                for edge in &self.relations {
+                                    if edge.source == current {
+                                        if !is_fastq_path(&edge.target) &&
+                                            self.artifacts.iter().any(|a| a.path == edge.target && a.kind != "script" && a.kind != "notebook") {
+                                            reaches_result = true;
+                                        }
+                                        pending.push(edge.target.as_str());
+                                    }
+                                }
+                            }
+                            reaches_result
+                        });
+                        ui.label(format!("Complete FASTQ → results provenance: {}", if complete { "Yes" } else { "No" }));
+                    });
                     ui.small("Issues are organized by their source script's analysis. Candidate assignments below are suggestions, not new provenance edges.");
                     let unassigned: Vec<&Issue> = self.issues.iter().filter(|i| i.decision == "open" && !self.analysis_assignment.contains_key(&i.notebook)).collect();
                     ui.collapsing(format!("Unassigned to an analysis · {} issue occurrences", unassigned.len()), |ui| {
@@ -936,3 +1028,27 @@ impl eframe::App for App {
 }
 // Shared scanner entry point for the headless batch executable. The GUI and CLI
 // intentionally use the exact same schema, parser and scanner implementation.
+
+#[cfg(test)]
+mod fastq_summary_tests {
+    use super::*;
+
+    #[test]
+    fn fastq_extensions_and_folder_groups() {
+        assert!(is_fastq_path("data/set1/sample_R1.fastq.gz"));
+        assert!(is_fastq_path("data/set2/sample_R2.FQ"));
+        assert!(!is_fastq_path("data/set2/matrix.mtx.gz"));
+        let paths = vec!["data/set1/a.fastq.gz".to_string(), "data/set2/b.fq.gz".to_string(), "other/c.fastq".to_string()];
+        assert_eq!(fastq_folders(&paths), vec![("data".into(), 2), ("other".into(), 1)]);
+    }
+
+    #[test]
+    fn relocated_h5_fixture_is_present() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/unlinked_fastq_fixture");
+        assert!(root.join("analysis1/analyze.py").is_file());
+        for i in 1..=3 {
+            assert!(root.join(format!("data/set{i}/set{i}.h5")).is_file());
+            assert!(!root.join(format!("analysis1/set{i}/set{i}.h5")).exists());
+        }
+    }
+}

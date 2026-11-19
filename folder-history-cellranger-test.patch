@@ -1,0 +1,67 @@
+--- a/src/core/engine.rs
++++ b/src/core/engine.rs
+@@ -948,6 +948,64 @@
+             failures.join("\n"));
+     }
+ 
++    fn cellranger_count_variable_subset_provenance() {
++        // Real directory tree, fake data. The command must never be executed.
++        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cellranger");
++        assert!(root.join("run_cellranger.sh").is_file());
++        let mut db = Connection::open_in_memory().unwrap();
++        schema(&db).unwrap();
++        scan(&mut db, &root, false, &AtomicBool::new(false), |_| {})
++            .expect("scan Cell Ranger fixture");
++
++        let input_files = [
++            "data/fastqs/sample_A/SampleA_S1_L001_R1_001.fastq.gz",
++            "data/fastqs/sample_A/SampleA_S1_L001_R2_001.fastq.gz",
++            "references/refdata-gex-GRCh38-2024-A/genes/genes.gtf",
++            "references/refdata-gex-GRCh38-2024-A/fasta/genome.fa",
++        ];
++        let outputs = [
++            "results/sample_A_count/outs/metrics_summary.csv",
++            "results/sample_A_count/outs/molecule_info.h5",
++            "results/sample_A_count/outs/filtered_feature_bc_matrix/matrix.mtx.gz",
++            "results/sample_A_count/outs/filtered_feature_bc_matrix/features.tsv.gz",
++            "results/sample_A_count/outs/filtered_feature_bc_matrix/barcodes.tsv.gz",
++        ];
++        let forbidden = [
++            "data/fastqs/sample_B/SampleB_S2_L001_R1_001.fastq.gz",
++            "data/fastqs/sample_B/SampleB_S2_L001_R2_001.fastq.gz",
++            "old/fastqs/Legacy_S1_L001_R1_001.fastq.gz",
++            "references/obsolete_reference/reference.json",
++            "config/feature_reference.csv",
++        ];
++        // Check inventory separately from inferred relationships.
++        for path in input_files.iter().chain(outputs.iter()).chain(forbidden.iter()) {
++            let count: i64 = db.query_row(
++                "SELECT COUNT(*) FROM artifacts WHERE path=?1", [path], |r| r.get(0)
++            ).unwrap();
++            assert_eq!(count, 1, "fixture file not inventoried: {path}");
++        }
++        let edges: std::collections::HashSet<(String, String)> = db.prepare(
++            "SELECT target, kind FROM relations WHERE source='run_cellranger.sh'"
++        ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
++            .unwrap().map(|r| r.unwrap()).collect();
++        // Input directory and reference directory must be expanded to real files.
++        for path in input_files {
++            assert!(edges.contains(&(path.to_string(), "reads".to_string())),
++                "Cell Ranger input not linked: {path}; actual={edges:?}");
++        }
++        // --id and cd determine the output tree, not the output basename.
++        for path in outputs {
++            assert!(edges.contains(&(path.to_string(), "writes".to_string())) ||
++                    edges.contains(&(path.to_string(), "writes_directory".to_string())),
++                "Cell Ranger output not linked: {path}; actual={edges:?}");
++        }
++        for path in forbidden {
++            assert!(!edges.iter().any(|(target, _)| target == path),
++                "unused variable incorrectly created a link to {path}");
++        }
++    }
++
++    #[test]
+     #[test]
+     fn shell_extracts_samtools() {
+         let op=extract_shell("samtools sort -o results/a.sorted.bam input/a.bam").unwrap();

@@ -26,41 +26,56 @@ fn assignment(line: &str) -> Option<(String, String)> {
     Some((lhs.to_owned(), value.to_owned()))
 }
 
-fn candidates(root: &Path, source: &str, issues: &[Issue]) -> Vec<Candidate> {
+// Only indexed physical artifacts can be classified. Symbolic expressions
+// remain investigation evidence; they are never displayed as file rows.
+fn candidates(source: &str, issues: &[Issue], db: Option<&Connection>) -> Vec<Candidate> {
+    let Some(db) = db else { return Vec::new(); };
+    let paths: HashSet<String> = match db.prepare("SELECT path FROM artifacts") {
+        Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
     let mut found: BTreeMap<String, Candidate> = BTreeMap::new();
-    for issue in issues {
-        if issue.notebook != source { continue; }
-        let path = issue.filename.clone();
-        found.entry(path.clone()).or_insert(Candidate {
-            folder: Path::new(&path).extension().is_none(), path, variable: String::new(),
-        });
+    // Existing confirmed/inferred read and write edges are authoritative
+    // candidates for review, including wildcard-expanded H5 files.
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT target FROM relations WHERE source=?1 AND kind IN ('reads','writes','writes_directory')"
+    ) {
+        if let Ok(rows) = stmt.query_map(params![source], |r| r.get::<_, String>(0)) {
+            for path in rows.flatten() {
+                if paths.contains(&path) {
+                    found.entry(path.clone()).or_insert(Candidate {
+                        folder: false, path, variable: String::new(),
+                    });
+                }
+            }
+        }
     }
-    let source_path = Path::new(source);
-    if source_path.is_absolute() || source_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-        return found.into_values().collect();
+    // An unresolved issue may also refer to a real file, but only after
+    // unambiguous resolution against the inventory.
+    for issue in issues.iter().filter(|i| i.notebook == source) {
+        if let Some(path) = engine::classified_artifact_path(&issue.filename, source, &paths) {
+            found.entry(path.clone()).or_insert(Candidate {
+                folder: false, path, variable: String::new(),
+            });
+        }
     }
-    let full = root.join(source_path);
-    let content = match std::fs::read_to_string(full) { Ok(s) => s, Err(_) => return found.into_values().collect() };
-    let lines: Vec<String> = if source.ends_with(".ipynb") {
-        serde_json::from_str::<serde_json::Value>(&content).ok()
-            .and_then(|v| v.get("cells")?.as_array().cloned())
-            .unwrap_or_default().iter()
-            .flat_map(|cell| match cell.get("source") {
-                Some(serde_json::Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>(),
-                Some(serde_json::Value::String(s)) => vec![s.clone()],
-                _ => vec![],
-            }).flat_map(|s| s.lines().map(str::to_owned).collect::<Vec<_>>()).collect()
-    } else { content.lines().map(str::to_owned).collect() };
-    for line in lines {
-        if let Some((variable, path)) = assignment(&line) {
-            let folder = Path::new(&path).extension().is_none();
-            found.entry(path.clone()).and_modify(|c| c.variable = variable.clone())
-                .or_insert(Candidate { path, variable, folder });
+    if let Ok(mut stmt) = db.prepare("SELECT DISTINCT path FROM relocation_candidates WHERE source=?1") {
+        if let Ok(rows) = stmt.query_map(params![source], |r| r.get::<_, String>(0)) {
+            for path in rows.flatten() {
+                if paths.contains(&path) {
+                    found.entry(path.clone()).or_insert(Candidate {
+                        folder: false, path,
+                        variable: "Possible relocated file (unverified)".into(),
+                    });
+                }
+            }
         }
     }
     found.into_values().collect()
 }
-
 // Classifications resolve investigation questions, not unverified read/write edges.
 fn matches_issue_path(issue_path: &str, candidate_path: &str) -> bool {
     let issue = issue_path.replace('\\', "/");
@@ -122,6 +137,7 @@ impl App {
     pub(super) fn draw_investigation(&mut self, ui: &mut egui::Ui) {
         let Some((_, selected)) = self.active_dependency.clone() else { self.wizard_mode = false; return; };
         let Some(root) = self.root.clone() else { self.wizard_mode = false; return; };
+        let _ = &root; // Retain the selected analysis root for subsequent recovery UI.
         ui.horizontal(|ui| {
             if ui.button("← Back to overview").clicked() { self.wizard_mode = false; }
             ui.separator(); ui.heading("File & folder classification");
@@ -132,7 +148,7 @@ impl App {
         let Some(source) = source else { ui.label("No source script recorded for this reference."); return; };
         ui.label(&source);
         ui.separator();
-        let items = candidates(&root, &source, &self.issues);
+        let items = candidates(&source, &self.issues, self.db.as_ref());
         if items.is_empty() { ui.label("No classifiable files or folders found in this script."); return; }
         let mut saved: HashMap<String, String> = HashMap::new();
         if let Some(db) = &self.db {
@@ -329,6 +345,22 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_shows_real_linked_files_not_symbolic_expressions() {
+        let db = Connection::open_in_memory().unwrap();
+        engine::schema(&db).unwrap();
+        let script = "scripts/notebook.ipynb";
+        for path in ["scripts/adult-spring/data.h5", "scripts/adult-summer/data.h5"] {
+            db.execute("INSERT INTO artifacts(path,kind) VALUES (?1,'matrix')", params![path]).unwrap();
+            db.execute("INSERT INTO relations(source,target,kind,evidence) VALUES (?1,?2,'reads','glob')", params![script,path]).unwrap();
+        }
+        let issues = vec![Issue { id: 1, notebook: script.into(), cell: 1,
+            filename: "analyzed_cellranger_h5_\"+adatas[0].obs['sname'][0]+\".h5ad".into(),
+            category: "unresolved".into(), decision: "open".into(), note: String::new() }];
+        let items = candidates(script, &issues, Some(&db));
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| item.path.ends_with("data.h5")));
+    }
     #[test]
     fn bulk_classification_updates_every_row() {
         let items = vec![

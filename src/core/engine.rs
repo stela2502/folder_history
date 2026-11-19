@@ -11,6 +11,9 @@ pub fn schema(db: &Connection) -> Result<()> {
             UNIQUE(source,target,kind,evidence));
         CREATE INDEX IF NOT EXISTS rel_source ON relations(source);
         CREATE INDEX IF NOT EXISTS rel_target ON relations(target);
+        CREATE TABLE IF NOT EXISTS relocation_candidates (
+            source TEXT NOT NULL, line INTEGER NOT NULL, expression TEXT NOT NULL,
+            path TEXT NOT NULL, PRIMARY KEY(source,line,expression,path));
         CREATE TABLE IF NOT EXISTS issues (
             id INTEGER PRIMARY KEY, notebook TEXT NOT NULL, cell INTEGER NOT NULL,
             filename TEXT NOT NULL, category TEXT NOT NULL,
@@ -31,6 +34,10 @@ pub fn schema(db: &Connection) -> Result<()> {
         source TEXT NOT NULL, path TEXT NOT NULL, role TEXT NOT NULL,
         confirmed INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY(source,path)
+    );")?;
+    // Directory review decisions are annotations, never deletion instructions.
+    db.execute_batch("CREATE TABLE IF NOT EXISTS folder_reviews (
+        path TEXT PRIMARY KEY, decision TEXT NOT NULL
     );")?;
     // Canonical scientist-confirmed roles, shared by the wizard, scanner and UI.
     // Source-scoped legacy evidence is retained in file_classifications.
@@ -532,6 +539,7 @@ pub fn scan(db: &mut Connection, root: &Path, hidden: bool, cancel: &AtomicBool,
     tx.execute("DELETE FROM notebook_observations", [])?;
     tx.execute("DELETE FROM notebook_expressions", [])?;
     tx.execute("DELETE FROM notebook_candidates", [])?;
+    tx.execute("DELETE FROM relocation_candidates", [])?;
     tx.execute("DELETE FROM symlink_findings", [])?;
     for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
         if !entry.path_is_symlink() { continue; }
@@ -915,22 +923,27 @@ mod tests {
                 "cluster.ipynb", "normalized.h5ad", "normalize.ipynb",
                 "original.h5ad", "create_h5ad.py", "matrix.mtx.gz",
                 "run_mapping.sh", "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz",
+                "old/original.h5ad",
             ]),
             ("stats_output/marker_expression.tsv", &[
                 "stats_output", "cluster.ipynb", "alternative_stats.ipynb",
                 "clustered.h5ad", "normalized.h5ad", "original.h5ad",
                 "create_h5ad.py", "run_mapping.sh",
                 "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz",
+                "old/original.h5ad",
             ]),
             ("cell_cycle_stats/phase_statistics.tsv", &[
                 "cell_cycle_stats", "cell_cycle.ipynb", "original.h5ad",
                 "create_h5ad.py", "run_mapping.sh",
                 "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz",
+                "old/original.h5ad",
             ]),
             ("processed.h5ad", &["r_analysis.ipynb", "original.h5ad",
-                "create_h5ad.py", "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz"]),
+                "create_h5ad.py", "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz",
+                "old/original.h5ad"]),
             ("r_processed.h5ad", &["normalize.R", "original.h5ad",
-                "create_h5ad.py", "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz"]),
+                "create_h5ad.py", "sample_A_R1.fastq.gz", "sample_A_R2.fastq.gz",
+                "old/original.h5ad"]),
         ];
         let mut failures = Vec::new();
         for (output, expected) in cases {
@@ -938,7 +951,7 @@ mod tests {
             let missing: Vec<_> = expected.iter()
                 .filter(|node| !upstream.contains(**node)).copied().collect();
             let forbidden: Vec<_> = ["sample_B_R1.fastq.gz", "sample_B_R2.fastq.gz",
-                "old/original.h5ad", "old/processed.h5ad", "old/mapping.sh"]
+                "old/processed.h5ad", "old/mapping.sh"]
                 .into_iter().filter(|node| upstream.contains(*node)).collect();
             if !missing.is_empty() || !forbidden.is_empty() {
                 failures.push(format!("{output}: missing={missing:?}; unexpected={forbidden:?}"));
@@ -946,6 +959,65 @@ mod tests {
         }
         assert!(failures.is_empty(), "Full provenance chains broken:\n{}",
             failures.join("\n"));
+    }
+
+    #[test]
+    #[ignore = "Cell Ranger provenance not implemented yet"]
+    fn cellranger_count_variable_subset_provenance() {
+        // Real directory tree, fake data. The command must never be executed.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cellranger");
+        assert!(root.join("run_cellranger.sh").is_file());
+        let mut db = Connection::open_in_memory().unwrap();
+        schema(&db).unwrap();
+        scan(&mut db, &root, false, &AtomicBool::new(false), |_| {})
+            .expect("scan Cell Ranger fixture");
+
+        let input_files = [
+            "data/fastqs/sample_A/SampleA_S1_L001_R1_001.fastq.gz",
+            "data/fastqs/sample_A/SampleA_S1_L001_R2_001.fastq.gz",
+            "references/refdata-gex-GRCh38-2024-A/genes/genes.gtf",
+            "references/refdata-gex-GRCh38-2024-A/fasta/genome.fa",
+        ];
+        let outputs = [
+            "results/sample_A_count/outs/metrics_summary.csv",
+            "results/sample_A_count/outs/molecule_info.h5",
+            "results/sample_A_count/outs/filtered_feature_bc_matrix/matrix.mtx.gz",
+            "results/sample_A_count/outs/filtered_feature_bc_matrix/features.tsv.gz",
+            "results/sample_A_count/outs/filtered_feature_bc_matrix/barcodes.tsv.gz",
+        ];
+        let forbidden = [
+            "data/fastqs/sample_B/SampleB_S2_L001_R1_001.fastq.gz",
+            "data/fastqs/sample_B/SampleB_S2_L001_R2_001.fastq.gz",
+            "old/fastqs/Legacy_S1_L001_R1_001.fastq.gz",
+            "references/obsolete_reference/reference.json",
+            "config/feature_reference.csv",
+        ];
+        // Check inventory separately from inferred relationships.
+        for path in input_files.iter().chain(outputs.iter()).chain(forbidden.iter()) {
+            let count: i64 = db.query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE path=?1", [path], |r| r.get(0)
+            ).unwrap();
+            assert_eq!(count, 1, "fixture file not inventoried: {path}");
+        }
+        let edges: std::collections::HashSet<(String, String)> = db.prepare(
+            "SELECT target, kind FROM relations WHERE source='run_cellranger.sh'"
+        ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap().map(|r| r.unwrap()).collect();
+        // Input directory and reference directory must be expanded to real files.
+        for path in input_files {
+            assert!(edges.contains(&(path.to_string(), "reads".to_string())),
+                "Cell Ranger input not linked: {path}; actual={edges:?}");
+        }
+        // --id and cd determine the output tree, not the output basename.
+        for path in outputs {
+            assert!(edges.contains(&(path.to_string(), "writes".to_string())) ||
+                    edges.contains(&(path.to_string(), "writes_directory".to_string())),
+                "Cell Ranger output not linked: {path}; actual={edges:?}");
+        }
+        for path in forbidden {
+            assert!(!edges.iter().any(|(target, _)| target == path),
+                "unused variable incorrectly created a link to {path}");
+        }
     }
 
     #[test]

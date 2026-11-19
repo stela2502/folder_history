@@ -55,6 +55,38 @@ fn file_role(path: &str, kind: &str, relations: &[Relation]) -> (egui::Color32, 
     } else { (egui::Color32::LIGHT_GRAY, if kind.is_empty() { "file" } else { "other" }) }
 }
 
+// A shape is always visible; fill indicates recorded relationships.
+#[derive(Clone, Copy)]
+enum RelationshipShape { Raw, Input, Output }
+
+fn relationship_badge(ui: &mut egui::Ui, shape: RelationshipShape, count: usize, label: &str) {
+    let color = match shape {
+        RelationshipShape::Raw => egui::Color32::from_rgb(180, 125, 240),
+        RelationshipShape::Input => egui::Color32::from_rgb(100, 175, 255),
+        RelationshipShape::Output => egui::Color32::from_rgb(235, 205, 90),
+    };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+    let center = rect.center();
+    let fill = if count > 0 { color } else { egui::Color32::TRANSPARENT };
+    let stroke = egui::Stroke::new(1.5, if count > 0 { color } else { egui::Color32::GRAY });
+    let painter = ui.painter();
+    match shape {
+        RelationshipShape::Raw => { painter.circle(center, 5.0, fill, stroke); }
+        RelationshipShape::Input => {
+            painter.rect(rect.shrink(3.0), 0.0, fill, stroke, egui::StrokeKind::Middle);
+        }
+        RelationshipShape::Output => {
+            let points = vec![
+                egui::pos2(center.x - 4.5, center.y - 5.0),
+                egui::pos2(center.x + 5.0, center.y),
+                egui::pos2(center.x - 4.5, center.y + 5.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(points, fill, stroke));
+        }
+    }
+    ui.label(format!("{count} {label}"));
+}
+
 // A script is a provenance actor, not a collection inferred from its filename.
 fn is_analysis_script(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
@@ -83,16 +115,53 @@ fn show_spectator_file(
     });
 }
 
+// Review only physical, unlinked directory trees. Never group across a protected
+// FASTQ, script, or provenance endpoint, and never collapse the archive root.
+fn reviewable_folders<'a>(unassigned: &[&'a str], protected: &std::collections::HashSet<&str>)
+    -> (BTreeMap<String, Vec<&'a str>>, Vec<&'a str>)
+{
+    let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    let mut loose = Vec::new();
+    for &path in unassigned {
+        let mut parent = path.rsplit_once('/').map(|(p, _)| p);
+        let mut best = None;
+        while let Some(dir) = parent {
+            if dir.is_empty() { break; }
+            let prefix = format!("{dir}/");
+            if protected.iter().any(|p| *p == dir || p.starts_with(&prefix)) { break; }
+            best = Some(dir);
+            parent = dir.rsplit_once('/').map(|(p, _)| p);
+        }
+        if let Some(dir) = best {
+            groups.entry(dir.to_owned()).or_default().push(path);
+        } else { loose.push(path); }
+    }
+    (groups, loose)
+}
+
 impl App {
     pub(crate) fn show_spectator(&mut self, ui: &mut egui::Ui) {
         ui.heading("Scientific analyses · Spectator");
         ui.label("Folder → scripts / notebooks → raw input, other input, output. Only recorded relationships attach files to scripts.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Relationships:");
+            relationship_badge(ui, RelationshipShape::Raw, 1, "raw (purple)");
+            relationship_badge(ui, RelationshipShape::Input, 1, "input (blue)");
+            relationship_badge(ui, RelationshipShape::Output, 1, "output (yellow)");
+            ui.weak("Filled = files present · Outline = none");
+        });
         ui.separator();
 
         let by_path: HashMap<&str, &Artifact> = self.artifacts.iter()
             .map(|a| (a.path.as_str(), a)).collect();
         let relations = &self.relations;
         let mut pending: Vec<(String, Option<i64>, FileAction)> = Vec::new();
+        let mut folder_actions: Vec<(String, bool)> = Vec::new();
+        let folder_reviews: HashMap<String, String> = self.db.as_ref().and_then(|db| {
+            let mut stmt = db.prepare("SELECT path,decision FROM folder_reviews").ok()?;
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .ok()?.collect::<rusqlite::Result<_>>().ok()
+        }).unwrap_or_default();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for group in &self.analysis_groups {
                 let title = self.group_names.get(&group.key)
@@ -171,8 +240,10 @@ impl App {
                             let id = ui.make_persistent_id(("spectator-script-v2", script));
                             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
                                 .show_header(ui, |ui| {
-                                    ui.label(format!("{basename} · {} raw · {} input · {} output",
-                                        raw.len(), input.len(), output.len())).on_hover_text(script);
+                                    ui.label(basename).on_hover_text(script);
+                                    relationship_badge(ui, RelationshipShape::Raw, raw.len(), "raw");
+                                    relationship_badge(ui, RelationshipShape::Input, input.len(), "input");
+                                    relationship_badge(ui, RelationshipShape::Output, output.len(), "output");
                                     if ui.small_button("Open").clicked() {
                                         pending.push((script.to_owned(), by_path.get(script).map(|a| a.id), FileAction::Open));
                                     }
@@ -192,7 +263,29 @@ impl App {
                         }
                         if !unassigned.is_empty() {
                             ui.collapsing(format!("Unassigned files · {}", unassigned.len()), |ui| {
-                                for path in unassigned {
+                                let mut protected: std::collections::HashSet<&str> = group.paths.iter()
+                                    .map(String::as_str).filter(|p| is_fastq(p) || is_analysis_script(p)).collect();
+                                for relation in relations {
+                                    protected.insert(&relation.source);
+                                    protected.insert(&relation.target);
+                                }
+                                let (folders, loose) = reviewable_folders(&unassigned, &protected);
+                                for (dir, members) in folders {
+                                    let previous = folder_reviews.get(&dir).map(String::as_str);
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("📁 {dir}/ · {} unlinked files", members.len()));
+                                        if ui.small_button("Open folder").clicked() {
+                                            pending.push((dir.clone(), None, FileAction::OpenParent));
+                                        }
+                                        if previous == Some("useless") {
+                                            ui.weak("Useless (reviewed)");
+                                            if ui.small_button("Undo").clicked() { folder_actions.push((dir.clone(), false)); }
+                                        } else if ui.small_button("Mark useless").clicked() {
+                                            folder_actions.push((dir.clone(), true));
+                                        }
+                                    });
+                                }
+                                for path in loose {
                                     show_spectator_file(ui, path, &by_path, relations,
                                         self.selected, &mut pending);
                                 }
@@ -204,5 +297,45 @@ impl App {
         for (path, id, action) in pending {
             apply_file_action(self, ui, &path, id, action);
         }
+        for (path, useless) in folder_actions {
+            if let Some(db) = &self.db {
+                let result = if useless {
+                    db.execute("INSERT INTO folder_reviews(path,decision) VALUES (?1,'useless')
+                        ON CONFLICT(path) DO UPDATE SET decision='useless'", params![path])
+                } else {
+                    db.execute("DELETE FROM folder_reviews WHERE path=?1", params![path])
+                };
+                match result {
+                    Ok(_) => { self.status = format!("Folder review updated: {path}"); self.publish(); }
+                    Err(e) => self.status = format!("Cannot save folder review: {e}"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod folder_review_tests {
+    use super::*;
+    #[test]
+    fn groups_unlinked_images_but_not_protected_trees() {
+        let files = ["images/run1/a.tif", "images/run2/b.tif", "raw/set1/a.txt",
+            "raw/set2/b.txt", "loose.txt"];
+        let protected = std::collections::HashSet::from(["raw/set1/sample.fastq.gz"]);
+        let (groups, loose) = reviewable_folders(&files, &protected);
+        assert_eq!(groups["images"].len(), 2);
+        assert!(!groups.contains_key("raw"));
+        assert_eq!(groups["raw/set2"], vec!["raw/set2/b.txt"]);
+        assert!(loose.contains(&"loose.txt"));
+        assert!(loose.contains(&"raw/set1/a.txt"));
+    }
+    #[test]
+    fn review_decision_survives_schema_reopen() {
+        let db = Connection::open_in_memory().unwrap();
+        engine::schema(&db).unwrap();
+        db.execute("INSERT INTO folder_reviews(path,decision) VALUES ('images','useless')", []).unwrap();
+        engine::schema(&db).unwrap();
+        let role: String = db.query_row("SELECT decision FROM folder_reviews WHERE path='images'", [], |r| r.get(0)).unwrap();
+        assert_eq!(role, "useless");
     }
 }
