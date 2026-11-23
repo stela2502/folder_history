@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-use anyhow::{Context, Result};
+use anyhow::Result;
 use eframe::egui;
 //use regex::Regex;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::params;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::process::Command;

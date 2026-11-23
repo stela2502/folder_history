@@ -54,10 +54,7 @@ impl Variable {
 
 pub(super) fn match_candidate(db:&Connection, rel:&str, line:usize, expr:&str, label:&str, env:&Environment, paths:&HashSet<String>, malformed:bool) -> Result<usize> {
     let Some(v)=Variable::resolve_exact(expr,env) else {return Ok(0)};
-    let (resolved,external,ambiguous)=resolve_reference(&v,rel,paths);
-    let filename=reference_name(&v);
-    if external {record_issue(db,rel,line,&filename,"external")?;}
-    if ambiguous {record_issue(db,rel,line,&filename,"ambiguous")?;}
+    let (resolved,_external,_ambiguous)=resolve_reference(&v,rel,paths);
     if let Some(target)=resolved {
         let mut kind=direction(label);
         // The path variable may convey direction even if the called function is unfamiliar.
@@ -69,10 +66,11 @@ pub(super) fn match_candidate(db:&Connection, rel:&str, line:usize, expr:&str, l
         } else {
             format!("{}: line/cell {}: candidate via {}",rel,line,label)
         };
-        add_relation(db,rel,&target,kind,&evidence,false)?;
+        if kind != "references" {
+            super::super::history_db::DbProvenance::record_match(db,rel,line,&v,&target,kind,&evidence)?;
+        }
         return Ok(1);
     }
-    if !external && !ambiguous && !filename.is_empty() {record_issue(db,rel,line,&filename,"unresolved")?;}
     Ok(0)
 }
 // A small lexical pass: find file operations without requiring balanced calls.
@@ -157,7 +155,7 @@ pub(super) fn plot_outputs(
         if !external && !ambiguous {
             if let Some(target) = resolved {
                 let evidence = format!("{rel}: line/cell {line}: inferred {} save output ({canonical_call})", rule.module);
-                add_relation(db, rel, &target, "writes", &evidence, false)?;
+                super::super::history_db::DbProvenance::record_match(db, rel, line, &candidate, &target, "writes", &evidence)?;
                 count += 1;
             }
         }

@@ -8,7 +8,7 @@ pub(super) fn has_named_file_argument(after_open: &str) -> bool {
     })
 }
 
-pub(super) fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String>, plots:&[PlotRule], language:&str)->Vec<(usize,String,usize)> {
+pub(super) fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<String,String>, plots:&[PlotRule], operation_rules:&[OperationRule], language:&str)->Vec<(usize,String,usize)> {
     let bytes=source.as_bytes(); let mut found=Vec::new();
     let mut i=0; let mut quote:Option<u8>=None; let mut escaped=false; let mut comment=false;
     while i<bytes.len() {
@@ -26,7 +26,7 @@ pub(super) fn operations(source:&str, rules:&[FunctionRule], imports:&HashMap<St
             while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i]==b'_' || bytes[i]==b'.') {i+=1;}
             let label=&source[start..i];
             let mut open=i;while open<bytes.len() && bytes[open].is_ascii_whitespace(){open+=1;}
-            if open<bytes.len() && bytes[open]==b'(' && (file_operation(label) || rules.iter().any(|r| r.language == language && r.name == (if language == "r" {label} else {label.rsplit('.').next().unwrap_or(label)})) || plots.iter().any(|p| canonical(label, imports).starts_with(&(p.module.clone()+"."))) || has_named_file_argument(&source[open+1..])) {
+            if open<bytes.len() && bytes[open]==b'(' && (operation_rules.iter().any(|r| r.language == language && operation_name_matches(&r.name, label, imports, language)) || file_operation(label) || rules.iter().any(|r| r.language == language && r.name == (if language == "r" {label} else {label.rsplit('.').next().unwrap_or(label)})) || plots.iter().any(|p| canonical(label, imports).starts_with(&(p.module.clone()+"."))) || has_named_file_argument(&source[open+1..])) {
                 let line=source[..start].bytes().filter(|b|*b==b'\n').count()+1;
                 found.push((line,label.to_owned(),open+1));
             }
@@ -159,7 +159,7 @@ pub(super) fn fragment_candidates(db: &Connection, rel: &str, line: usize, label
             "{rel}: cell/line {line}: inferred {kind} via {label}({arg}); symbolic fragments: {}",
             fragments.join(" | ")
         );
-        add_relation(db, rel, path, kind, &evidence, false)?;
+        super::super::history_db::DbProvenance::record_match(db, rel, line, &arg, path, kind, &evidence)?;
     }
     Ok(matches.len())
 }

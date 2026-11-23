@@ -26,6 +26,7 @@ pub(super) fn cell_language(source: &str, default: &'static str) -> &'static str
 }
 pub(crate) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->Result<usize>{
     let rules=load_rules(root)?;
+    let operation_rules=load_operation_rules(root)?;
     let plots=load_plot_rules(root)?;
     let content=std::fs::read_to_string(root.join(rel))?;
     if rel.ends_with(".ipynb") {
@@ -37,14 +38,14 @@ pub(crate) fn parse(db:&Connection,root:&Path,rel:&str,paths:&HashSet<String>)->
                 if cell["cell_type"]!="code" {continue;}
                 let src=if let Some(a)=cell["source"].as_array(){a.iter().filter_map(|v|v.as_str()).collect::<String>()}else{cell["source"].as_str().unwrap_or("").to_string()};
                 let language=cell_language(&src, default_language);
-                count+=analyze_source(db,rel,&src,idx+1,paths,&mut env,&rules,&mut imports,&plots,language)?;
+                count+=analyze_source(db,rel,&src,idx+1,paths,&mut env,&rules,&mut imports,&plots,&operation_rules,language)?;
             }
         }
         Ok(count)
     } else {
         let shell=rel.ends_with(".sh")||rel.ends_with(".bash");
         let lines:Vec<(usize,String)>=content.lines().enumerate().map(|(i,s)|(i+1,s.to_owned())).collect();
-        analyze_lines(db,rel,&lines,paths,shell,&rules,&plots)
+        analyze_lines(db,rel,&lines,paths,shell,&rules,&plots,&operation_rules)
     }
 }
 

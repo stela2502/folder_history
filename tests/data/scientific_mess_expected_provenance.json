@@ -44,10 +44,10 @@
     [
       "create_h5ad.py",
       "WRITES",
-      "original.h5ad"
+      "old/original.h5ad"
     ],
     [
-      "original.h5ad",
+      "old/original.h5ad",
       "READ_BY",
       "normalize.ipynb"
     ],
@@ -92,7 +92,7 @@
       "de_results"
     ],
     [
-      "original.h5ad",
+      "old/original.h5ad",
       "READ_BY",
       "cell_cycle.ipynb"
     ],
@@ -107,7 +107,7 @@
       "cell_cycle_stats"
     ],
     [
-      "original.h5ad",
+      "old/original.h5ad",
       "READ_BY",
       "r_analysis.ipynb"
     ],
@@ -117,7 +117,7 @@
       "processed.h5ad"
     ],
     [
-      "original.h5ad",
+      "old/original.h5ad",
       "READ_BY",
       "normalize.R"
     ],
@@ -127,7 +127,7 @@
       "r_processed.h5ad"
     ],
     [
-      "original.h5ad",
+      "old/original.h5ad",
       "READ_BY",
       "read_only.ipynb"
     ]

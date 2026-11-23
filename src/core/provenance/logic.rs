@@ -169,54 +169,56 @@ pub(super) fn record_logic_links(db: &Connection, rel: &str, line: usize, result
     let mut count = 0;
     for result in results {
         for variable in &result.links.files {
-            let candidates: Vec<String> = match variable {
+            let (expression, candidates): (String, Vec<String>) = match variable {
                 Variable::Exact(path) => {
-                    let (resolved, external, ambiguous) = resolve_reference(path, rel, paths);
-                    if external { record_issue(db, rel, line, &reference_name(path), "external")?; }
-                    if ambiguous { record_issue(db, rel, line, &reference_name(path), "ambiguous")?; }
-                    if resolved.is_none() && !external && !ambiguous {
-                        let expression = FilePath::new(vec![PathPart::Literal(path.clone())]);
-                        if let FileMatches::Funky(found) = expression.find_matches(rel, paths) {
-                            for candidate in found {
-                                db.execute("INSERT OR IGNORE INTO relocation_candidates(source,line,expression,path) VALUES (?1,?2,?3,?4)",
-                                    params![rel,line as i64,path,candidate])?;
-                            }
-                            record_issue(db, rel, line, path, "unresolved")?;
+                    let (resolved, _, _) = resolve_reference(path, rel, paths);
+                    let found = if let Some(target) = resolved { vec![target] } else {
+                        let matcher = FilePath::new(vec![PathPart::Literal(path.clone())]);
+                        match matcher.find_matches(rel, paths) {
+                            FileMatches::Strict(found) | FileMatches::Funky(found) => found,
+                            FileMatches::None => Vec::new(),
                         }
-                    }
-                    resolved.into_iter().collect()
+                    };
+                    (path.clone(), found)
                 }
                 Variable::Parts(path) => {
-                    let fragments = path.ordered_fragments();
-                    let wildcard_filename = path.parts.iter().any(|part| matches!(part, PathPart::Wildcard))
-                        && path.parts.iter().any(|part| matches!(part, PathPart::Literal(s) if s.contains('.')));
-                    if !wildcard_filename && (fragments.is_empty() || (fragments.len() == 1 && fragments[0].len() < 12)) { continue; }
-                    let matched = match path.find_matches(rel, paths) {
-                        FileMatches::Strict(found) => found,
-                        FileMatches::Funky(found) => {
-                            let pattern = path.parts.iter().map(|part| match part {
-                                PathPart::Literal(s) => s.clone(),
-                                PathPart::Wildcard => "*".to_owned(),
-                            }).collect::<String>();
-                            for candidate in found {
-                                db.execute("INSERT OR IGNORE INTO relocation_candidates(source,line,expression,path) VALUES (?1,?2,?3,?4)",
-                                    params![rel,line as i64,&pattern,candidate])?;
-                            }
-                            record_issue(db, rel, line, &pattern, "unresolved")?;
-                            Vec::new() // suggestions are never automatic provenance edges
-                        }
-                        FileMatches::None => Vec::new(),
-                    };
-                    if matched.len() > 30 { continue; }
-                    matched
+                    let expression = path.parts.iter().map(|part| match part {
+                        PathPart::Literal(s) => s.clone(),
+                        PathPart::Wildcard => "*".to_owned(),
+                    }).collect::<String>();
+                    // A fully expanded shell variable is a concrete path, not a
+                    // fuzzy expression. Resolve it against the source directory
+                    // using the same inventory-aware resolver as literal links.
+                    // This also handles `./` and trailing directory separators.
+                    if !path.contains_wildcards() {
+                        let (resolved, _, _) = resolve_reference(&expression, rel, paths);
+                        (expression, resolved.into_iter().collect())
+                    } else {
+                        let fragments = path.ordered_fragments();
+                        let wildcard_filename = path.parts.iter().any(|part| matches!(part, PathPart::Literal(s) if s.contains('.')));
+                        if !wildcard_filename && (fragments.is_empty() || (fragments.len() == 1 && fragments[0].len() < 12)) { continue; }
+                        let found = match path.find_matches(rel, paths) {
+                            FileMatches::Strict(found) | FileMatches::Funky(found) => found,
+                            FileMatches::None => Vec::new(),
+                        };
+                        (expression, found)
+                    }
                 }
                 Variable::Unknown => continue,
             };
+            if candidates.len() > 30 { continue; }
             for target in candidates {
-                let is_dir = paths.iter().any(|p| p.starts_with(&format!("{target}/")));
+                // Empty directories have no descendants; the scanner indexes
+                // them explicitly as directory artifacts before parsing scripts.
+                let indexed_directory = db.query_row(
+                    "SELECT kind='directory' FROM artifacts WHERE path=?1",
+                    [&target], |row| row.get::<_, bool>(0),
+                ).unwrap_or(false);
+                let is_dir = indexed_directory || paths.iter().any(|p| p.starts_with(&format!("{target}/")));
                 let kind = if is_dir && result.kind == LinkType::Writes { "writes_directory" } else { result.kind.as_str() };
+                if kind == "references" { continue; }
                 let evidence = format!("{rel}: cell/line {line}: {} via {}({})", if matches!(variable, Variable::Parts(_)) { "inferred" } else { "explicit" }, result.function, result.expression);
-                add_relation(db, rel, &target, kind, &evidence, false)?;
+                super::super::history_db::DbProvenance::record_match(db, rel, line, &expression, &target, kind, &evidence)?;
                 count += 1;
             }
         }

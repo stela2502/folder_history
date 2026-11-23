@@ -350,13 +350,8 @@ pub fn read_index(root: &Path) -> Result<(Vec<Artifact>, Vec<Relation>, Vec<Issu
     if !path.is_file() { bail!("No FolderHistory index found in {}", root.display()); }
     let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("Opening {}", path.display()))?;
-    let mut q = db.prepare("SELECT id,path,kind FROM artifacts ORDER BY path")?;
-    let artifacts = q.query_map([], |r| Ok(Artifact{id:r.get(0)?,path:r.get(1)?,kind:r.get(2)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut q = db.prepare("SELECT id,source,target,kind,evidence,manual FROM relations ORDER BY id")?;
-    let relations = q.query_map([], |r| Ok(Relation{id:r.get(0)?,source:r.get(1)?,target:r.get(2)?,kind:r.get(3)?,evidence:r.get(4)?,manual:r.get::<_,i32>(5)?!=0}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut q = db.prepare("SELECT id,notebook,cell,filename,category,decision,note FROM issues ORDER BY category,notebook,cell")?;
-    let issues = q.query_map([], |r| Ok(Issue{id:r.get(0)?,notebook:r.get(1)?,cell:r.get(2)?,filename:r.get(3)?,category:r.get(4)?,decision:r.get(5)?,note:r.get(6)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok((artifacts,relations,issues))
+    use super::history_db::DbArchiveView;
+    db.archive_view()
 }
 fn is_managed(name: &str, existing: &str) -> bool {
     existing.contains(MARKER) || (name == "README.html"

@@ -1,6 +1,6 @@
 # Source-verified function contracts. Inference is conditional on indexed outputs.
 # An output is not proof that a historical function call actually executed.
-version: 1
+version: 2
 functions:
   - name: export2cellexalvr
     language: r
@@ -60,3 +60,190 @@ plotting:
     default_directory: figures
     format_setting: scvelo.settings.file_format_figs
     default_format: png
+
+# Generic CLI provenance. Arguments are parsed by flag, not filename heuristics.
+operations:
+  - name: sc-analyse
+    subcommand: gex
+    language: bash
+    source: stela2502/lumrik
+    arguments:
+      - name: --data
+        role: input
+        kind: file
+        cardinality: many
+      - name: --sample-names
+        role: parameter
+        kind: value
+        cardinality: many
+      - name: --out
+        role: output
+        kind: directory
+        descendants: true
+
+  # samtools commands with explicit output arguments. Stdout-only commands
+  # are intentionally omitted: shell redirection belongs to the shell parser.
+  - name: samtools
+    subcommand: sort
+    language: bash
+    source: samtools sort CLI
+    arguments:
+      - {name: -o, role: output, kind: file}
+      - {name: -T, role: parameter, kind: value}
+      - {position: last, role: input, kind: file}
+  - name: samtools
+    subcommand: view
+    language: bash
+    source: samtools view CLI
+    arguments:
+      - {name: -o, role: output, kind: file}
+      - {name: -U, role: output, kind: file}
+      - {position: 1, role: input, kind: file}
+  - name: samtools
+    subcommand: fastq
+    language: bash
+    source: samtools fastq CLI
+    arguments:
+      - {name: -1, role: output, kind: file}
+      - {name: -2, role: output, kind: file}
+      - {name: -0, role: output, kind: file}
+      - {name: -s, role: output, kind: file}
+  - name: samtools
+    subcommand: merge
+    language: bash
+    source: samtools merge CLI
+    arguments:
+      - {name: -o, role: output, kind: file}
+      - {name: -f, role: parameter, kind: value, cardinality: zero}
+      - {position: 1, role: output, kind: file}
+      - {position: 2, through: last, role: input, kind: file}
+
+  # Cell Ranger count output normally derives from --id (outs/ inside
+  # the run directory). Current YAML cannot express that transformation.
+  # Only input paths are represented until derived-path rules exist.
+  - name: cellranger
+    subcommand: count
+    language: bash
+    source: 10x Genomics Cell Ranger count CLI
+    arguments:
+      - {name: --fastqs, role: input, kind: directory}
+      - {name: --transcriptome, role: input, kind: directory}
+      - {name: --libraries, role: input, kind: file}
+      - {name: --feature-ref, role: input, kind: file}
+      - {name: --id, role: parameter, kind: value}
+      - {name: --sample, role: parameter, kind: value}
+  - name: cellranger
+    subcommand: vdj
+    language: bash
+    source: 10x Genomics Cell Ranger vdj CLI
+    arguments:
+      - {name: --fastqs, role: input, kind: directory}
+      - {name: --reference, role: input, kind: directory}
+      - {name: --id, role: parameter, kind: value}
+  - name: cellranger
+    subcommand: mkref
+    language: bash
+    source: 10x Genomics Cell Ranger mkref CLI
+    arguments:
+      - {name: --genome, role: parameter, kind: value}
+      - {name: --fasta, role: input, kind: file, cardinality: many}
+      - {name: --genes, role: input, kind: file, cardinality: many}
+
+  # MultiQC writes reports into a directory. Only use a dedicated
+  # output directory: a shared destination yields inferred attribution.
+  - name: multiqc
+    language: bash
+    source: MultiQC CLI
+    arguments:
+      - {name: --outdir, role: output, kind: directory, descendants: true}
+      - {name: -o, role: output, kind: directory, descendants: true}
+      - {name: --filename, role: parameter, kind: value}
+
+  # FastQC outputs are named from the input basename, not all files in
+  # the output directory. Deliberately do not mark -o as directory output.
+  - name: fastqc
+    language: bash
+    source: FastQC CLI
+    arguments:
+      - {name: --outdir, role: parameter, kind: directory}
+      - {name: -o, role: parameter, kind: directory}
+
+  # Scanpy / AnnData I/O (official Scanpy Reading and Writing docs).
+  # The callable name is canonicalized using Python import aliases.
+  - name: scanpy.read_h5ad
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/generated/scanpy.read_h5ad.html
+    arguments:
+      - {name: filename, position: 1, role: input, kind: file}
+  - name: scanpy.read_10x_h5
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/api/io.html
+    arguments:
+      - {name: filename, position: 1, role: input, kind: file}
+  - name: scanpy.read_10x_mtx
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/api/io.html
+    arguments:
+      - {name: path, position: 1, role: input, kind: directory}
+  - name: scanpy.read_mtx
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/api/io.html
+    arguments:
+      - {name: filename, position: 1, role: input, kind: file}
+  - name: scanpy.read_csv
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/api/io.html
+    arguments:
+      - {name: filename, position: 1, role: input, kind: file}
+  - name: write_h5ad
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/usage-principles.html
+    arguments:
+      - {name: filename, position: 1, role: output, kind: file}
+  - name: write_zarr
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/usage-principles.html
+    arguments:
+      - {name: store, position: 1, role: output, kind: directory, descendants: true}
+  - name: write_csvs
+    language: python
+    source: https://scanpy.readthedocs.io/en/stable/usage-principles.html
+    arguments:
+      - {name: dirname, position: 1, role: output, kind: directory, descendants: true}
+
+  # Seurat / SeuratDisk / base R I/O.
+  - name: Read10X
+    language: r
+    source: https://satijalab.org/seurat/reference/read10x
+    arguments:
+      - {name: data.dir, position: 1, role: input, kind: directory}
+  - name: Read10X_h5
+    language: r
+    source: https://satijalab.org/seurat/reference/read10x_h5
+    arguments:
+      - {name: filename, position: 1, role: input, kind: file}
+  - name: readRDS
+    language: r
+    source: base R readRDS
+    arguments:
+      - {name: file, position: 1, role: input, kind: file}
+  - name: saveRDS
+    language: r
+    source: base R saveRDS
+    arguments:
+      - {name: file, position: 2, role: output, kind: file}
+  - name: load
+    language: r
+    source: base R load
+    arguments:
+      - {name: file, position: 1, role: input, kind: file}
+  - name: SaveH5Seurat
+    language: r
+    source: SeuratDisk SaveH5Seurat
+    arguments:
+      - {name: filename, position: 2, role: output, kind: file}
+  - name: LoadH5Seurat
+    language: r
+    source: SeuratDisk LoadH5Seurat
+    arguments:
+      - {name: file, position: 1, role: input, kind: file}

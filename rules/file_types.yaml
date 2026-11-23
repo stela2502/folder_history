@@ -1,0 +1,34 @@
+# Built-in classifications. Override in ~/.folder_history/file_types.yaml
+# or <dataset>/.folder_history/file_types.yaml. All roles use ArtifactRole.
+version: 2
+file_types:
+  - {pattern: "*.fastq.gz", file_type: RawData}
+  - {pattern: "*.fq.gz", file_type: RawData}
+  - {pattern: "*.fastq", file_type: RawData}
+  - {pattern: "*.fq", file_type: RawData}
+  - {pattern: "*.bam", file_type: ProcessedData}
+  - {pattern: "*.cram", file_type: ProcessedData}
+  - {pattern: "*.h5", file_type: ProcessedData}
+  - {pattern: "*.h5ad", file_type: ProcessedData}
+  - {pattern: "*.loom", file_type: ProcessedData}
+  - {pattern: "*.rds", file_type: ProcessedData}
+  - {pattern: "*.mtx.gz", file_type: ProcessedData}
+  - {pattern: "*.vcf", file_type: ProcessedData}
+  - {pattern: "*.vcf.gz", file_type: ProcessedData}
+  - {pattern: "*.gtf", file_type: ReferenceData}
+  - {pattern: "*.gff3", file_type: ReferenceData}
+  - {pattern: "*.fa", file_type: ReferenceData}
+  - {pattern: "*.fasta", file_type: ReferenceData}
+  - {pattern: "*.png", file_type: FiguresImages}
+  - {pattern: "*.svg", file_type: FiguresImages}
+  - {pattern: "*.pdf", file_type: FiguresImages}
+  - {pattern: "*.csv", file_type: OtherDataFile}
+  - {pattern: "*.tsv", file_type: OtherDataFile}
+  - {pattern: "*.txt", file_type: OtherDataFile}
+  - {pattern: "*.db", file_type: OtherDataFile}
+  - {pattern: "*.sqlite", file_type: OtherDataFile}
+file_groups:
+  - name: 10x MEX
+    required: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
+    file_type: ProcessedData
+    members_file_type: ProcessedData

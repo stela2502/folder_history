@@ -3,17 +3,15 @@ pub(super) fn rule_output(db: &Connection, rel: &str, line: usize, candidate: &s
                paths: &HashSet<String>) -> Result<usize> {
     let (resolved, external, ambiguous) = resolve_reference(candidate, rel, paths);
     if external {
-        record_issue(db, rel, line, &reference_name(candidate), "external")?;
         return Ok(0);
     }
     if ambiguous {
-        record_issue(db, rel, line, &reference_name(candidate), "ambiguous")?;
         return Ok(0);
     }
     if let Some(target) = resolved {
         let evidence = format!("{}: cell/line {}: function rule {} ({})", rel, line, rule.name, rule.source);
         let is_directory = paths.iter().any(|p| p.starts_with(&format!("{target}/")));
-        add_relation(db, rel, &target, if is_directory {"writes_directory"} else {"writes"}, &evidence, false)?;
+        super::super::history_db::DbProvenance::record_match(db, rel, line, candidate, &target, if is_directory {"writes_directory"} else {"writes"}, &evidence)?;
         return Ok(1);
     }
     Ok(0)

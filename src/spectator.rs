@@ -8,7 +8,7 @@ fn apply_file_action(app: &mut App, ui: &mut egui::Ui, path: &str, id: Option<i6
         FileAction::CopyPath => { if let Some(root) = &app.root { ui.ctx().copy_text(root.join(path).display().to_string()); } },
         FileAction::Open | FileAction::OpenParent => {
             if let Some(root) = &app.root {
-                let result = if action == FileAction::Open { open_indexed_file(root, path) } else { reveal_in_file_manager(root, path) };
+                let result = if action == FileAction::Open { open_indexed_entry(root, path) } else { reveal_in_file_manager(root, path) };
                 if let Err(e) = result { app.status = format!("Cannot open {}: {e}", path); }
             }
         }
@@ -240,7 +240,10 @@ impl App {
                             let id = ui.make_persistent_id(("spectator-script-v2", script));
                             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
                                 .show_header(ui, |ui| {
-                                    ui.label(basename).on_hover_text(script);
+                                    if ui.label(basename).on_hover_text(format!("{script}\nDouble-click to open"))
+                                        .double_clicked() {
+                                        pending.push((script.to_owned(), by_path.get(script).map(|a| a.id), FileAction::Open));
+                                    }
                                     relationship_badge(ui, RelationshipShape::Raw, raw.len(), "raw");
                                     relationship_badge(ui, RelationshipShape::Input, input.len(), "input");
                                     relationship_badge(ui, RelationshipShape::Output, output.len(), "output");
@@ -273,7 +276,10 @@ impl App {
                                 for (dir, members) in folders {
                                     let previous = folder_reviews.get(&dir).map(String::as_str);
                                     ui.horizontal(|ui| {
-                                        ui.label(format!("📁 {dir}/ · {} unlinked files", members.len()));
+                                        if ui.label(format!("📁 {dir}/ · {} unlinked files", members.len()))
+                                            .on_hover_text("Double-click to open folder").double_clicked() {
+                                            pending.push((dir.clone(), None, FileAction::Open));
+                                        }
                                         if ui.small_button("Open folder").clicked() {
                                             pending.push((dir.clone(), None, FileAction::OpenParent));
                                         }
@@ -317,6 +323,7 @@ impl App {
 #[cfg(test)]
 mod folder_review_tests {
     use super::*;
+    use rusqlite::Connection;
     #[test]
     fn groups_unlinked_images_but_not_protected_trees() {
         let files = ["images/run1/a.tif", "images/run2/b.tif", "raw/set1/a.txt",

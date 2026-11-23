@@ -4,6 +4,17 @@ use crate::*;
 pub(crate) enum Tab { Search, Graph, Build, Spectator }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchMode { Filename, ScriptType, Loads, Saves, Calls }
+impl SearchMode {
+    const ALL: [Self; 5] = [Self::Filename, Self::ScriptType, Self::Loads, Self::Saves, Self::Calls];
+    fn label(self) -> &'static str { match self {
+        Self::Filename => "Filename", Self::ScriptType => "Script type", Self::Loads => "Loads",
+        Self::Saves => "Saves", Self::Calls => "Calls",
+    }}
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NavState { tab: Tab, selected: Option<i64> }
 
 // The database stores archive-relative paths. Never pass these directly to the OS.
@@ -51,6 +62,22 @@ pub(crate) fn open_indexed_file(root: &Path, relative: &str) -> io::Result<()> {
     return Err(io::Error::new(io::ErrorKind::Unsupported, "No file opener for this OS"));
     #[cfg(any(windows, unix))]
     { cmd.spawn().map(|_| ()) }
+}
+
+// Shared external opener for archive entries. Files use their associated app;
+// directories use the system file manager. Missing entries remain an error.
+pub(crate) fn open_indexed_entry(root: &Path, relative: &str) -> io::Result<()> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() || candidate.components().any(|c| matches!(c,
+        std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unsafe archive-relative path"));
+    }
+    let absolute = root.join(candidate);
+    if absolute.is_dir() {
+        reveal_in_file_manager(root, relative)
+    } else {
+        open_indexed_file(root, relative)
+    }
 }
 
 // Candidate analysis membership is advisory. Never write these scores to the
@@ -113,13 +140,19 @@ pub(crate) fn fastq_folders(paths: &[String]) -> Vec<(String, usize)> {
     counts.into_iter().collect()
 }
 
-pub(crate) enum ScanEvent { Progress(String), Finished(Result<ScanResult, String>), Resolved(Result<(i64, i64), String>) }
+pub(crate) enum ScanEvent {
+    Progress(String),
+    Finished(Result<ScanResult, String>),
+    Resolved(Result<(i64, i64), String>),
+    // Constructed entirely off the egui thread; the GUI only swaps vectors.
+    Loaded { view: Box<App>, summary: String },
+}
 
 pub(crate) struct App {
-    pub(crate) root: Option<PathBuf>, local_workspace: Option<BatchWorkspace>, pub(crate) db: Option<Connection>, pub(crate) index_path: Option<PathBuf>,
-    pub(crate) tab: Tab, pub(crate) query: String, pub(crate) artifacts: Vec<Artifact>, pub(crate) relations: Vec<Relation>,
+    pub(crate) root: Option<PathBuf>, pub(crate) db: Option<folder_history::core::history_db::HistoryDatabase>, pub(crate) index_path: Option<PathBuf>,
+    pub(crate) tab: Tab, pub(crate) query: String, search_mode: SearchMode, search_group: String, search_steps: Vec<(String,String)>, pub(crate) artifacts: Vec<Artifact>, pub(crate) relations: Vec<Relation>,
     pub(crate) selected: Option<i64>, pub(crate) status: String, pub(crate) from: String, pub(crate) to: String,
-    pub(crate) relation_kind: String, pub(crate) note: String, pub(crate) show_all: bool, pub(crate) issues: Vec<Issue>, pub(crate) issue_filter: String, pub(crate) active_dependency: Option<(String,String)>, pub(crate) resolution_note: String, pub(super) wizard_index: usize, pub(super) wizard_mode: bool, pub(super) classification_choices: HashMap<String, String>, pub(super) classification_selected: HashMap<String, bool>, pub(super) recently_confirmed: Option<(String, String)>, pub(crate) scan_summary: String,
+    pub(crate) relation_kind: String, pub(crate) note: String, pub(crate) show_all: bool, pub(crate) issues: Vec<Issue>, pub(crate) issue_filter: String, pub(crate) ignored_review_scripts: HashSet<String>, pub(crate) active_dependency: Option<(String,String)>, pub(crate) resolution_note: String, pub(super) wizard_index: usize, pub(super) wizard_mode: bool, pub(super) wizard_data: Option<folder_history::core::history_db::WizardInternals>, pub(super) wizard_source: String, pub(super) classification_errors: HashMap<String, String>, pub(crate) scan_summary: String,
     pub(crate) group_filter: String, pub(crate) group_names: HashMap<String, String>, pub(crate) group_name_edit: String,
     pub(crate) analysis_groups: Vec<analysis_graph::AnalysisGroup>, pub(crate) analysis_assignment: HashMap<String, String>,
     pub(crate) nav_history: Vec<NavState>, pub(crate) nav_cursor: usize,
@@ -127,11 +160,11 @@ pub(crate) struct App {
 }
 impl Default for App {
     fn default() -> Self {
-        Self { root: None, local_workspace: None, db: None, index_path: None, tab: Tab::Search,
-            query: String::new(), artifacts: vec![], relations: vec![], selected: None,
+        Self { root: None, db: None, index_path: None, tab: Tab::Search,
+            query: String::new(), search_mode: SearchMode::Filename, search_group: String::new(), search_steps: Vec::new(), artifacts: vec![], relations: vec![], selected: None,
             status: "Open a research folder to begin.".into(), from: String::new(),
             to: String::new(), relation_kind: "derived_from".into(), note: String::new(),
-            show_all: false, issues: vec![], issue_filter: "all".into(), active_dependency: None, resolution_note: String::new(), wizard_index: 0, wizard_mode: false, classification_choices: HashMap::new(), classification_selected: HashMap::new(), recently_confirmed: None, scan_summary: String::new(),
+            show_all: false, issues: vec![], issue_filter: "unresolved".into(), ignored_review_scripts: HashSet::new(), active_dependency: None, resolution_note: String::new(), wizard_index: 0, wizard_mode: false, wizard_data: None, wizard_source: String::new(), classification_errors: HashMap::new(), scan_summary: String::new(),
             group_filter: String::new(), group_names: HashMap::new(), group_name_edit: String::new(),
             analysis_groups: Vec::new(), analysis_assignment: HashMap::new(),
             nav_history: vec![], nav_cursor: 0,
@@ -193,7 +226,6 @@ impl App {
                 return;
             }
             self.db = None; // Release any previous archive connection before its workspace.
-            self.local_workspace = loaded.local_workspace.take();
             self.root = loaded.root.take();
             self.db = loaded.db.take();
             self.index_path = loaded.index_path.take();
@@ -227,29 +259,16 @@ impl App {
     }
 
     fn open_sync(&mut self, root: PathBuf, analyze: bool, cancel: &AtomicBool) {
-        let result: Result<(Connection, BatchWorkspace, PathBuf, PathBuf)> = (|| {
+        let result: Result<folder_history::core::history_db::HistoryDatabase> = (|| {
             if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
-            if !root.is_dir() { anyhow::bail!("Folder does not exist: {}", root.display()); }
-            if analyze { probe_archive_write_access(&root)?; }
-            let (workspace, local, archive, exists) = archive_working_copy(&root)?;
+            let database = folder_history::core::history_db::HistoryDatabase::open(&root, !analyze, analyze)?;
             if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
-            if !exists && !analyze {
-                self.missing_index = Some(root.clone());
-                anyhow::bail!("No FolderHistory database found in .folder_history/history.sqlite");
-            }
-            // Both entry points use an editable local SQLite working copy.
-            // Tabs select a workflow, not a permission level.
-            let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
-            let db = Connection::open_with_flags(&local, flags)
-                .with_context(|| format!("Opening local SQLite {}", local.display()))?;
-            db.busy_timeout(std::time::Duration::from_secs(30))?;
-            db.execute_batch("PRAGMA journal_mode=DELETE;")?;
-            schema(&db)?;
-            if cancel.load(Ordering::Relaxed) { anyhow::bail!("Opening cancelled"); }
-            Ok((db, workspace, local, archive))
+            Ok(database)
         })();
         match result {
-            Ok((db, workspace, local, archive)) => {
+            Ok(db) => {
+                let local = db.local_path().to_path_buf();
+                let archive = db.archive_path().to_path_buf();
                 if cancel.load(Ordering::Relaxed) { return; }
                 self.recent_folders.retain(|p| p != &root);
                 self.recent_folders.insert(0, root.clone());
@@ -257,7 +276,6 @@ impl App {
                 let recent_save_error = save_recent_folders(&self.recent_folders).err();
                 self.nav_history.clear(); self.nav_cursor = 0;
                 self.root = Some(root); self.db = Some(db);
-                self.local_workspace = Some(workspace);
                 self.index_path = Some(local);
                 self.selected = None; self.active_dependency = None; self.group_filter.clear();
                 self.tab = if analyze { Tab::Build } else { Tab::Spectator };
@@ -285,31 +303,26 @@ impl App {
     }
 
     pub(crate) fn refresh(&mut self) {
-        self.artifacts.clear(); self.relations.clear(); self.issues.clear(); self.group_names.clear();
-        self.analysis_groups.clear(); self.analysis_assignment.clear();
+        self.artifacts.clear(); self.relations.clear(); self.issues.clear(); self.group_names.clear(); self.search_steps.clear();
+        self.analysis_groups.clear(); self.analysis_assignment.clear(); self.ignored_review_scripts.clear();
         let Some(db) = &self.db else { return; };
-        let result: Result<(Vec<Artifact>, Vec<Relation>, Vec<Issue>)> = (|| {
-            let mut q = db.prepare("SELECT id,path,kind FROM artifacts ORDER BY path")?;
-            let artifacts = q.query_map([], |r| Ok(Artifact { id:r.get(0)?,path:r.get(1)?,kind:r.get(2)? }))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut q = db.prepare("SELECT id,source,target,kind,evidence,manual FROM relations ORDER BY id")?;
-            let relations = q.query_map([], |r| Ok(Relation { id:r.get(0)?,source:r.get(1)?,target:r.get(2)?,kind:r.get(3)?,evidence:r.get(4)?,manual:r.get::<_,i32>(5)? != 0 }))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut q = db.prepare("SELECT id,notebook,cell,filename,category,decision,note FROM issues ORDER BY category,notebook,cell")?;
-            let issues = q.query_map([], |r| Ok(Issue { id:r.get(0)?, notebook:r.get(1)?, cell:r.get(2)?, filename:r.get(3)?, category:r.get(4)?, decision:r.get(5)?, note:r.get(6)? }))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok((artifacts, relations, issues))
-        })();
+        use folder_history::core::history_db::DbArchiveView;
+        let result = db.archive_view();
         match result { Ok((a,r,i)) => { self.artifacts=a;self.relations=r;self.issues=i; }, Err(e) => self.status=format!("Database error: {e:#}") }
         self.analysis_groups = analysis_graph::detect(&self.artifacts, &self.relations);
         for group in &self.analysis_groups {
             for path in &group.paths { self.analysis_assignment.insert(path.clone(), group.key.clone()); }
         }
         if let Some(db) = &self.db {
-            if let Ok(mut q) = db.prepare("SELECT source_folder,display_name FROM analysis_names") {
-                if let Ok(rows) = q.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))) {
-                    self.group_names = rows.flatten().collect();
-                }
+            self.search_steps = folder_history::core::search::load_steps(db).unwrap_or_default();
+            use folder_history::core::history_db::DbScriptReview;
+            match db.ignored_review_scripts() {
+                Ok(ignored) => self.ignored_review_scripts = ignored,
+                Err(e) => self.status = format!("Database error loading ignored scripts: {e:#}"),
+            }
+            match db.analysis_names() {
+                Ok(names) => self.group_names = names.into_iter().collect(),
+                Err(e) => self.status = format!("Database error loading analysis names: {e:#}"),
             }
         }
     }
@@ -328,33 +341,56 @@ impl App {
     }
     pub(crate) fn publish(&mut self) {
         if self.scan_events.is_some() { return; }
-        let (Some(db), Some(root), Some(local)) = (&self.db, &self.root, &self.index_path) else { return; };
-        let snapshot = local.with_extension("publish-snapshot.sqlite");
-        let result: Result<()> = (|| {
-            if snapshot.exists() { std::fs::remove_file(&snapshot)?; }
-            // Snapshot locally, even while the GUI holds its local connection open.
-            let escaped = snapshot.to_string_lossy().replace('\'', "''");
-            db.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
-            let archive = local_index_path(root);
-            publish_archive_snapshot(&snapshot, &archive)?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&snapshot);
-                self.status = "Published local SQLite snapshot to archive.".into();
-            }
-            Err(e) => {
-                // Keep the standalone VACUUM snapshot for manual transfer.
-                let archive = local_index_path(root);
-                self.status = if snapshot.is_file() {
-                    format!("Publication failed: {e:#} | Recovery SQLite snapshot: {} | Intended destination: {} | Local working DB: {}", snapshot.display(), archive.display(), local.display())
-                } else {
-                    format!("Publication failed: {e:#} | No recovery snapshot created. Local working DB: {} | Intended destination: {}", local.display(), archive.display())
-                };
-            }
+        let Some(db) = &mut self.db else { return; };
+        match db.publish() {
+            Ok(()) => self.status = "Published local SQLite snapshot to archive.".into(),
+            Err(e) => self.status = format!("Publication failed: {e:#}"),
         }
     }
+    // All expensive post-processing belongs to the worker, never poll_scan().
+    // Uses a separate local SQLite connection; no egui state crosses into the worker.
+    fn finish_scan_in_worker(
+        root: PathBuf,
+        index: PathBuf,
+        tx: &mpsc::Sender<ScanEvent>,
+        summary: String,
+        generate_html: bool,
+    ) -> Result<()> {
+        let _ = tx.send(ScanEvent::Progress("Loading provenance and analysis groups…".into()));
+        let mut view = App::default();
+        view.index_path = Some(index.clone());
+        let db = folder_history::core::history_db::HistoryDatabase::attach_worker(&root, &index)?;
+        view.root = Some(root);
+        view.db = Some(db);
+        view.refresh();
+        if view.status.starts_with("Database error:") {
+            anyhow::bail!("{}", view.status);
+        }
+        if generate_html {
+            let _ = tx.send(ScanEvent::Progress("Generating missing documentation…".into()));
+            view.ensure_missing_html();
+        }
+        let _ = tx.send(ScanEvent::Progress("Publishing SQLite snapshot to archive…".into()));
+        view.publish();
+        if view.status.starts_with("Publication failed:") {
+            anyhow::bail!("{}", view.status);
+        }
+        let _ = tx.send(ScanEvent::Loaded { view: Box::new(view), summary });
+        Ok(())
+    }
+
+    // Only cheap ownership transfers happen on the GUI thread.
+    fn install_scan_view(&mut self, mut view: App, summary: String) {
+        self.artifacts = std::mem::take(&mut view.artifacts);
+        self.relations = std::mem::take(&mut view.relations);
+        self.issues = std::mem::take(&mut view.issues);
+        self.group_names = std::mem::take(&mut view.group_names);
+        self.analysis_groups = std::mem::take(&mut view.analysis_groups);
+        self.analysis_assignment = std::mem::take(&mut view.analysis_assignment);
+        self.scan_summary = summary.clone();
+        self.status = summary;
+    }
+
     pub(crate) fn begin_scan(&mut self) {
         if self.scan_events.is_some() { return; }
         let (Some(root), Some(index)) = (self.root.clone(), self.index_path.clone()) else { return; };
@@ -367,75 +403,76 @@ impl App {
         self.scan_summary = "Re-scan started: inventory and provenance extraction running...".into();
         self.status = "Re-scan running; existing results remain available until completion.".into();
         std::thread::spawn(move || {
-            let result = (|| -> Result<ScanResult> {
-                let mut db = Connection::open(index)?;
-                db.busy_timeout(std::time::Duration::from_secs(30))?;
-                schema(&db)?;
-                scan(&mut db, &root, hidden, &worker_cancel, |message| {
-                    let _ = tx.send(ScanEvent::Progress(message));
-                })
-            })().map_err(|e| format!("{e:#}"));
-            let _ = tx.send(ScanEvent::Finished(result));
+            let result = (|| -> Result<()> {
+                let scan_result = {
+                    let mut db = folder_history::core::history_db::HistoryDatabase::attach_worker(&root, &index)?;
+                    db.scan(hidden, &worker_cancel, |message| {
+                        let _ = tx.send(ScanEvent::Progress(message));
+                    })?
+                }; // Close the writer before loading and publishing the snapshot.
+                let summary = format!("Inventory: {} files | Scripts: {} found, {} parsed | Shell steps: {} | Extracted references: {} | Warnings: {}",
+                    scan_result.files, scan_result.scripts, scan_result.parsed, scan_result.steps, scan_result.links, scan_result.warnings);
+                App::finish_scan_in_worker(root, index, &tx, summary, true)
+            })();
+            if let Err(e) = result {
+                let _ = tx.send(ScanEvent::Finished(Err(format!("{e:#}"))));
+            }
         });
     }
     pub(crate) fn begin_relink(&mut self) {
         if self.scan_events.is_some() { return; }
         let Some(index) = self.index_path.clone() else { return; };
+        let Some(root_for_relink) = self.root.clone() else { return; };
         let (tx, rx) = mpsc::channel();
         self.scan_events = Some(rx);
         self.status = "Re-evaluating stored provenance evidence (no filesystem scan)...".into();
         std::thread::spawn(move || {
-            let result = (|| -> Result<(i64, i64)> {
-                let mut db = Connection::open(index)?;
-                db.busy_timeout(std::time::Duration::from_secs(30))?;
-                db.busy_timeout(std::time::Duration::from_secs(30))?;
-                schema(&db)?;
-                relink_cached_evidence(&mut db)
-            })().map_err(|e| format!("{e:#}"));
-            let _ = tx.send(ScanEvent::Resolved(result));
+            let result = (|| -> Result<()> {
+                let (notebooks, chains) = {
+                    let mut db = folder_history::core::history_db::HistoryDatabase::attach_worker(&root_for_relink, &index)?;
+                    db.relink()?
+                };
+                let root = root_for_relink;
+                let summary = format!("Re-resolved cached evidence: {notebooks} notebook candidates, {chains} script-chain candidates. Manual resolutions preserved.");
+                App::finish_scan_in_worker(root, index, &tx, summary, false)
+            })();
+            if let Err(e) = result {
+                let _ = tx.send(ScanEvent::Resolved(Err(format!("{e:#}"))));
+            }
         });
     }
     pub(crate) fn poll_scan(&mut self) {
-        let mut finished = None;
-        let mut resolved = None;
+        let mut completed = None;
         if let Some(rx) = &self.scan_events {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    ScanEvent::Progress(message) => self.scan_summary = message,
-                    ScanEvent::Finished(result) => { finished = Some(result); break; }
-                    ScanEvent::Resolved(result) => { resolved = Some(result); break; }
+                    ScanEvent::Progress(message) => {
+                        self.scan_summary = message.clone();
+                        self.status = message;
+                    }
+                    other => { completed = Some(other); break; }
                 }
             }
         }
-        if let Some(result) = resolved {
-            self.scan_events = None;
-            match result {
-                Ok((notebooks, chains)) => {
-                    self.refresh();
-                    self.status = format!("Re-resolved cached evidence: {notebooks} notebook candidates, {chains} script-chain candidates. Manual resolutions preserved.");
-                    self.scan_summary = self.status.clone();
-                    self.publish();
-                }
-                Err(e) => { self.status = format!("Re-resolve failed: {e}"); self.error_popup = Some(self.status.clone()); },
+        match completed {
+            Some(ScanEvent::Loaded { view, summary }) => {
+                self.scan_events = None;
+                self.scan_cancel = None;
+                self.install_scan_view(*view, summary);
             }
-        }
-        if let Some(result) = finished {
-            self.scan_events = None;
-            self.scan_cancel = None;
-            match result {
-                Ok(r) => {
-                    self.scan_summary = format!("Inventory: {} files | Scripts: {} found, {} parsed | Shell steps: {} | Extracted references: {} | Warnings: {}",r.files,r.scripts,r.parsed,r.steps,r.links,r.warnings);
-                    self.status = self.scan_summary.clone();
-                    self.refresh();
-                    self.publish();
-                    self.ensure_missing_html();
-                }
-                Err(e) => {
-                    self.scan_summary = format!("Re-scan did not complete: {e}");
-                    self.status = self.scan_summary.clone();
-                    self.error_popup = Some(self.status.clone());
-                },
+            Some(ScanEvent::Finished(Err(e))) | Some(ScanEvent::Resolved(Err(e))) => {
+                self.scan_events = None;
+                self.scan_cancel = None;
+                self.scan_summary = format!("Background operation failed: {e}");
+                self.status = self.scan_summary.clone();
+                self.error_popup = Some(self.status.clone());
             }
+            Some(ScanEvent::Finished(Ok(_))) | Some(ScanEvent::Resolved(Ok(_))) => {
+                self.scan_events = None;
+                self.scan_cancel = None;
+                self.status = "Background worker ended without a refreshed view".into();
+            }
+            _ => {}
         }
     }
     // Diagnostics are deliberately archive-relative and bounded for sharing.
@@ -715,16 +752,42 @@ impl eframe::App for App {
                 Tab::Spectator => self.show_spectator(ui),
                 Tab::Search => {
                     ui.heading("Find research data");
-                    ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search filename, sample, notebook, FASTQ, figure..."));
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("search_analysis_group")
+                            .selected_text(if self.search_group.is_empty() { "All analyses".to_owned() } else {
+                                self.group_names.get(&self.search_group).cloned().or_else(||
+                                    self.analysis_groups.iter().find(|g| g.key == self.search_group).map(|g| g.suggested_name.clone()))
+                                    .unwrap_or_else(|| self.search_group.clone())
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.search_group, String::new(), "All analyses");
+                                for group in &self.analysis_groups {
+                                    let label = self.group_names.get(&group.key).cloned().unwrap_or_else(|| group.suggested_name.clone());
+                                    ui.selectable_value(&mut self.search_group, group.key.clone(), label);
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("search_mode")
+                            .selected_text(self.search_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in SearchMode::ALL { ui.selectable_value(&mut self.search_mode, mode, mode.label()); }
+                            });
+                    });
+                    ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(match self.search_mode {
+                        SearchMode::Filename => "Filename, e.g. *.h5ad",
+                        SearchMode::ScriptType => "Script extension, e.g. *.ipynb, *.R, *.sh",
+                        SearchMode::Loads => "Read files, e.g. *.fastq.gz",
+                        SearchMode::Saves => "Written files, e.g. *.tsv",
+                        SearchMode::Calls => "Function or command, e.g. write_stats_tables",
+                    }));
                     ui.checkbox(&mut self.show_all, "Show all files (without search)");
                     ui.separator();
-                    let needle = self.query.to_ascii_lowercase();
-                    let matches: Vec<(i64,String,String)> = self.artifacts.iter()
-                        .filter(|a| (self.show_all || !needle.is_empty()) && a.path.to_ascii_lowercase().contains(&needle))
-                        .take(500).map(|a| (a.id,a.path.clone(),a.kind.clone())).collect();
+                    let matches: Vec<(i64,String,String,String)> = folder_history::core::search::find(
+                        &self.artifacts, &self.relations, &self.analysis_assignment,
+                        &self.search_group, self.search_mode.label(), &self.query, self.show_all, &self.search_steps, 500);
+                    ui.small(format!("{} matching indexed files", matches.len()));
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (id,path,kind) in matches {
-                            let response = ui.selectable_label(self.selected==Some(id), format!("[{kind}] {path}"))
+                        for (id,path,kind,reason) in matches {
+                            let response = ui.selectable_label(self.selected==Some(id), format!("[{kind}] {path}  {reason}"))
                                 .on_hover_text("Double-click to open; right-click for file actions");
                             response.context_menu(|ui| {
                                 if ui.button("Open file").clicked() {
@@ -932,50 +995,174 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    ui.label("One row per dependency. Select a file to inspect its evidence and resolve every matching occurrence.");
+                    ui.heading("Script provenance review");
+                    ui.small("Folder → script / notebook → references. Double-click opens the source externally.");
+                    // Status is per script, never per individual occurrence.
+                    let mut open_by_script = HashMap::<String, usize>::new();
+                    for issue in &self.issues {
+                        if issue.decision == "open" {
+                            *open_by_script.entry(issue.notebook.clone()).or_default() += 1;
+                        }
+                    }
+                    let mut scripts = BTreeMap::<String, Vec<String>>::new();
+                    for artifact in &self.artifacts {
+                        let path = &artifact.path;
+                        let lower = path.to_ascii_lowercase();
+                        if [".py", ".r", ".rmd", ".ipynb", ".sh", ".nf", ".rscript"]
+                            .iter().any(|ext| lower.ends_with(ext)) {
+                            let folder = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+                            scripts.entry(folder.to_owned()).or_default().push(path.clone());
+                        }
+                    }
+                    let mut unresolved_scripts = 0usize;
+                    let mut resolved_scripts = 0usize;
+                    let mut ignored_scripts = 0usize;
+                    for entries in scripts.values() {
+                        for source in entries {
+                            if !self.group_filter.is_empty() &&
+                                self.analysis_assignment.get(source) != Some(&self.group_filter) { continue; }
+                            if self.ignored_review_scripts.contains(source) {
+                                ignored_scripts += 1;
+                            } else if open_by_script.get(source).copied().unwrap_or(0) > 0 {
+                                unresolved_scripts += 1;
+                            } else {
+                                resolved_scripts += 1;
+                            }
+                        }
+                    }
                     ui.horizontal_wrapped(|ui| {
-                        for category in ["all", "external", "unresolved", "ambiguous", "resolved"] {
-                            let n = self.issues.iter().filter(|i| {
-                                if category == "resolved" { i.decision != "open" }
-                                else if category == "all" { i.decision == "open" }
-                                else { i.category == category && i.decision == "open" }
-                            }).map(|i| (i.notebook.as_str(), i.filename.as_str()))
-                              .collect::<HashSet<_>>().len();
-                            if ui.selectable_label(self.issue_filter == category, format!("{category} ({n})")).clicked() {
+                        for (category, count) in [("unresolved", unresolved_scripts), ("ignored", ignored_scripts), ("resolved", resolved_scripts)] {
+                            if ui.selectable_label(self.issue_filter == category, format!("{category} ({count})")).clicked() {
                                 self.issue_filter = category.into();
                                 self.active_dependency = None;
                             }
                         }
                     });
-                    ui.separator();
-                    {
-
-                        let mut groups = std::collections::BTreeMap::<(String,String,String),usize>::new();
-                        for issue in &self.issues {
-                            let show = match self.issue_filter.as_str() {
-                                "resolved" => issue.decision != "open",
-                                "all" => issue.decision == "open",
-                                category => issue.category == category && issue.decision == "open",
-                            };
-                            if show && (self.group_filter.is_empty() || self.analysis_assignment.get(&issue.notebook)==Some(&self.group_filter)) { *groups.entry((issue.notebook.clone(),issue.category.clone(),issue.filename.clone())).or_default() += 1; }
+                    let show_unresolved = self.issue_filter != "resolved";
+                    let show_ignored = self.issue_filter == "ignored";
+                    let mut folders = BTreeMap::<String, BTreeMap<String, Vec<(String, String, usize)>>>::new();
+                    for (folder, entries) in scripts {
+                        for source in entries {
+                            if !self.group_filter.is_empty() &&
+                                self.analysis_assignment.get(&source) != Some(&self.group_filter) { continue; }
+                            let has_open = open_by_script.get(&source).copied().unwrap_or(0) > 0;
+                            if self.ignored_review_scripts.contains(&source) != show_ignored { continue; }
+                            if !show_ignored && has_open != show_unresolved { continue; }
+                            folders.entry(folder.clone()).or_default().entry(source).or_default();
                         }
-                        let focus = self.recently_confirmed.take();
-                        egui::ScrollArea::vertical().id_salt("issue_list").max_height(320.0).show(ui, |ui| {
-                            for ((source, category, filename), count) in groups {
-                                let is_recent = focus.as_ref().is_some_and(|(s, p)| s == &source && (p == &filename || filename.ends_with(p)));
-                                let response = ui.selectable_label(is_recent, format!("{filename} ({count})  ·  {category} · {source}"));
-                                if is_recent { response.scroll_to_me(Some(egui::Align::Center)); }
-                                if response.clicked() {
-                                    self.resolution_note = self.issues.iter()
-                                        .find(|i| i.notebook == source && i.category == category && i.filename == filename)
-                                        .map(|i| i.note.clone()).unwrap_or_default();
-                                    self.wizard_index = self.issues.iter().position(|i| i.notebook == source && i.filename == filename && i.category == category).unwrap_or(0);
-                                    self.active_dependency = Some((category, filename));
-                                    self.wizard_mode = true;
-                                    ui.ctx().request_repaint();
+                    }
+                    if show_unresolved {
+                        for issue in self.issues.iter().filter(|i| i.decision == "open") {
+                            let folder = issue.notebook.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+                            if let Some(refs) = folders.get_mut(folder).and_then(|scripts| scripts.get_mut(&issue.notebook)) {
+                                if let Some(existing) = refs.iter_mut().find(|(category, filename, _)|
+                                    category == &issue.category && filename == &issue.filename) {
+                                    existing.2 += 1;
+                                } else {
+                                    refs.push((issue.category.clone(), issue.filename.clone(), 1));
                                 }
                             }
-                        });
+                        }
+                    } else {
+                        for edge in &self.relations {
+                            let folder = edge.source.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+                            if let Some(refs) = folders.get_mut(folder).and_then(|scripts| scripts.get_mut(&edge.source)) {
+                                if matches!(edge.kind.as_str(), "reads" | "writes" | "writes_directory") &&
+                                    !refs.iter().any(|(_, path, _)| path == &edge.target) {
+                                    refs.push((format!("✓ {} · {}", if edge.manual { "manual" } else { "auto" }, edge.kind), edge.target.clone(), 1));
+                                }
+                            }
+                        }
+                    }
+                    let mut review_action: Option<(String, bool)> = None;
+                    let mut selected_script: Option<(String, Option<(String, String)>)> = None;
+                    let mut open_script: Option<String> = None;
+                    let mut open_entry: Option<String> = None;
+                    let mut open_folder: Option<String> = None;
+                    egui::ScrollArea::vertical().id_salt("repair_script_tree").max_height(420.0).show(ui, |ui| {
+                        for (folder, scripts) in folders {
+                            let count: usize = scripts.values().map(|refs| refs.iter().map(|r| r.2).sum::<usize>()).sum();
+                            let folder_header = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(), ui.make_persistent_id(("repair_folder_open", &folder)), false);
+                            folder_header.show_header(ui, |ui| {
+                                if ui.label(format!("📁 {folder} · {} scripts · {count} occurrences", scripts.len()))
+                                    .on_hover_text("Double-click to open folder").double_clicked() {
+                                    open_folder = Some(folder.clone());
+                                }
+                            }).body(|ui| {
+                                for (script, refs) in scripts {
+                                    let name = script.rsplit('/').next().unwrap_or(&script);
+                                    let count: usize = refs.iter().map(|r| r.2).sum();
+                                    ui.horizontal(|ui| {
+                                        let response = ui.selectable_label(false, format!("{name} · {count} {}", if show_unresolved { "issues" } else { "links" }))
+                                            .on_hover_text(&script);
+                                        if response.double_clicked() { open_script = Some(script.clone()); }
+                                        else if response.clicked() { selected_script = Some((script.clone(), None)); }
+                                        if ui.small_button("Review").clicked() { selected_script = Some((script.clone(), None)); }
+                                        if ui.small_button("Open").clicked() { open_script = Some(script.clone()); }
+                                        if show_ignored {
+                                            if ui.small_button("Restore").clicked() { review_action = Some((script.clone(), false)); }
+                                        } else if ui.small_button("Ignore").on_hover_text("Move to Ignored; scanning and automatic provenance continue").clicked() {
+                                            review_action = Some((script.clone(), true));
+                                        }
+                                    });
+                                    ui.indent(("repair_refs", &script), |ui| {
+                                        for (category, filename, occurrences) in &refs {
+                                            let response = ui.selectable_label(false, format!("{filename} ({occurrences}) · {category}"))
+                                                .on_hover_text(format!("Source: {script}\nDouble-click to open file/folder"));
+                                            if response.double_clicked() {
+                                                open_entry = Some(filename.clone());
+                                            } else if response.clicked() {
+                                                selected_script = Some((script.clone(), Some((category.clone(), filename.clone()))));
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    if let Some((source, ignored)) = review_action {
+                        use folder_history::core::history_db::DbScriptReview;
+                        if let Some(db) = &self.db {
+                            match db.set_script_ignored(&source, ignored) {
+                                Ok(()) => {
+                                    if ignored { self.ignored_review_scripts.insert(source); }
+                                    else { self.ignored_review_scripts.remove(&source); }
+                                    self.publish();
+                                }
+                                Err(e) => self.status = format!("Review status save failed: {e:#}"),
+                            }
+                        }
+                    }
+                    if let Some(folder) = open_folder {
+                        if let Some(root) = &self.root {
+                            if let Err(e) = open_indexed_entry(root, &folder) { self.status = format!("Cannot open folder: {e}"); }
+                        }
+                    }
+                    if let Some(path) = open_entry {
+                        if let Some(root) = &self.root {
+                            if let Err(e) = open_indexed_entry(root, &path) { self.status = format!("Cannot open entry: {e}"); }
+                        }
+                    }
+                    if let Some(script) = open_script {
+                        if let Some(root) = &self.root {
+                            if let Err(e) = open_indexed_file(root, &script) { self.status = format!("Cannot open script: {e}"); }
+                        }
+                    }
+                    if let Some((source, reference)) = selected_script {
+                        if let Some(index) = self.issues.iter().position(|i| i.notebook == source &&
+                            reference.as_ref().is_none_or(|(category, filename)| &i.category == category && &i.filename == filename)) {
+                            self.wizard_index = index;
+                            let issue = &self.issues[index];
+                            self.active_dependency = Some((issue.category.clone(), issue.filename.clone()));
+                            self.resolution_note = issue.note.clone();
+                            self.wizard_mode = true;
+                        } else {
+                            self.wizard_source = source;
+                            self.wizard_data = None;
+                            self.active_dependency = Some(("script".into(), "<script review>".into()));
+                            self.wizard_mode = true;
+                        }
                     }
                     ui.label("Default scan excludes all dot-folders, dot-files and generated work/ directories.");
                     if self.scan_events.is_none() && self.db.is_some() {

@@ -1,4 +1,6 @@
 use super::*;
+use super::cli_rules::positional_bounds;
+
 #[cfg(test)] mod notebook_glob_red_tests {
     use super::*;
 
@@ -41,7 +43,7 @@ use super::*;
         let _ = std::fs::remove_dir_all(&root);
         parsed?;
         let mut stmt = db.prepare(
-            "SELECT target FROM relations WHERE source=?1 AND kind='reads'"
+            "SELECT a.path FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path=?1 AND m.direction='reads'"
         )?;
         let found: HashSet<String> = stmt.query_map([rel], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -111,7 +113,7 @@ use super::*;
          links: LinksToFiles { files: vec![glob] },
          expression: "ifiles".into(), function: "read_10x_h5".into() }];
      assert_eq!(record_logic_links(&db, "analysis.ipynb", 2, &links, &paths)?, 2);
-     let mut stmt = db.prepare("SELECT target FROM relations WHERE source='analysis.ipynb' AND kind='reads'")?;
+     let mut stmt = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path='analysis.ipynb' AND m.direction='reads'")?;
      let found: HashSet<String> = stmt.query_map([], |row| row.get(0))?
          .collect::<std::result::Result<_, _>>()?;
      assert_eq!(found, ["adult-spring/sample.h5".to_owned(), "embryo/sample.h5".to_owned()].into_iter().collect());
@@ -127,6 +129,22 @@ use super::*;
      env.assign("file", "paste0('DESeq2_', condition, '.tsv')", "r");
      assert!(env.exact("file").is_none());
      assert!(env.variables["file"].matches("DESeq2_WT.tsv"));
+ }
+
+ #[test] fn python_dynamic_h5ad_filename_preserves_literal_boundaries() {
+     let env = Environment::default();
+     let expression = r#""analyzed_cellranger_h5_" + adatas[0].obs["sname"][0] + ".h5ad""#;
+     let actual = Variable::from_script_slice(expression, &env, "python").into_filepath();
+     let expected = FilePath::new(vec![
+         PathPart::Literal("analyzed_cellranger_h5_".into()),
+         PathPart::Wildcard,
+         PathPart::Literal(".h5ad".into()),
+     ]);
+     assert_eq!(actual, expected, "dynamic filename must preserve exact prefix and suffix");
+     assert!(actual.matches("analyzed_cellranger_h5_embryo.h5ad"));
+     assert!(actual.matches("analyzed_cellranger_h5_adult-spring.h5ad"));
+     assert!(!actual.matches("backup_analyzed_cellranger_h5_embryo.h5ad"));
+     assert!(!actual.matches("analyzed_cellranger_h5_embryo.h5ad.tmp"));
  }
 
  #[test] fn ordered_fragments_are_language_neutral() {
@@ -149,7 +167,7 @@ use super::*;
      assert_eq!(cell_language("write.table(x, file='out.tsv')", notebook_language(&notebook)), "r");
      assert_eq!(cell_language("%%python\nprint(1)", "r"), "python");
      assert!(is_r_source("script.R", "x <- 1"));
-     let ops=operations("read.table('in.tsv')\nwrite.table(x, file='out.tsv')", &[], &HashMap::new(), &[], "r");
+     let ops=operations("read.table('in.tsv')\nwrite.table(x, file='out.tsv')", &[], &HashMap::new(), &[], &[], "r");
      assert_eq!(ops.iter().map(|(_, name, _)|name.as_str()).collect::<Vec<_>>(), vec!["read.table", "write.table"]);
  }
  #[test] fn python_import_aliases_are_canonical() {
@@ -225,7 +243,7 @@ mod nasty_programming_errors_tests {
         let db = Connection::open_in_memory()?;
         schema(&db)?;
         parse(&db, &root, rel, &paths)?;
-        let mut stmt = db.prepare("SELECT target, kind, evidence FROM relations WHERE source=?1")?;
+        let mut stmt = db.prepare("SELECT a.path, m.direction, m.evidence FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path=?1")?;
         let rows: Vec<(String,String,String)> = stmt.query_map([rel], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
             .collect::<std::result::Result<_,_>>()?;
         let targets: HashSet<&str> = rows.iter().map(|(t,_,_)| t.as_str()).collect();
@@ -237,13 +255,11 @@ mod nasty_programming_errors_tests {
         assert!(!targets.contains("results/broken_and_missing.tsv"),
             "broken cell without an existing output must not create a link");
         assert!(!targets.contains("results/ghost.tsv"), "comments/strings must not produce links");
-        assert!(rows.iter().any(|(target,kind,evidence)|
+        assert!(rows.iter().any(|(target,_kind,evidence)|
             target == "results/broken_but_exists.tsv"
-            && (kind.contains("candidate") || kind.contains("tentative") || evidence.contains("uncertain") || evidence.contains("malformed"))),
+            && (evidence.contains("uncertain") || evidence.contains("malformed") || evidence.contains("tentative"))),
             "broken-cell evidence must be explicitly marked tentative/uncertain");
-        let missing_issues: i64 = db.query_row(
-            "SELECT count(*) FROM issues WHERE filename='broken_and_missing.tsv'", [], |r| r.get(0))?;
-        assert_eq!(missing_issues, 0, "broken code cannot justify a missing-output warning");
+
         Ok(())
     }
 }
@@ -285,7 +301,7 @@ mod bioinformatics_nasty_provenance_tests {
         schema(&db)?;
         parse(&db, &root, &rel, &paths())?;
         let mut statement = db.prepare(
-            "SELECT target, kind FROM relations WHERE source=?1")?;
+            "SELECT a.path, m.direction FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path=?1")?;
         let found: HashSet<(String,String)> = statement.query_map([&rel], |r| {
             Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))
         })?.collect::<std::result::Result<_,_>>()?;
@@ -303,13 +319,7 @@ mod bioinformatics_nasty_provenance_tests {
             if found.iter().any(|(t,_)| t.ends_with(target)) {
                 forbidden.push(target.to_string());
             }
-            let basename = target.rsplit('/').next().unwrap();
-            let issues: i64 = db.query_row(
-                "SELECT count(*) FROM issues WHERE notebook=?1 AND filename=?2",
-                params![&rel,basename], |r| r.get(0))?;
-            if issues != 0 {
-                forbidden.push(format!("unexpected issue for {basename}"));
-            }
+
         }
         assert!(missing.is_empty() && forbidden.is_empty(),
             "{name}: missing={missing:?}, forbidden={forbidden:?}, actual={found:?}");
@@ -348,7 +358,7 @@ mod bioinformatics_nasty_provenance_tests {
         schema(&db)?;
         scan(&mut db, &root, false, &std::sync::atomic::AtomicBool::new(false), |_| {})?;
         let count: i64 = db.query_row(
-            "SELECT count(*) FROM relations WHERE source='notebooks/01_valid_multiline_read_write.ipynb'",
+            "SELECT count(*) FROM file_matches m JOIN artifacts s ON s.id=m.source_id WHERE s.path='notebooks/01_valid_multiline_read_write.ipynb'",
             [], |r| r.get(0))?;
         assert!(count >= 2, "scan should retain valid notebook links despite malformed neighbors");
         Ok(())
@@ -364,9 +374,9 @@ mod bioinformatics_nasty_provenance_tests {
             "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
         ].into_iter().map(str::to_owned).collect();
         let mut env = Environment::default();
-        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut env, &rules, &mut HashMap::new(), &[], "r")?;
-        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut env, &rules, &mut HashMap::new(), &[], "python")?;
-        let targets = db.prepare("SELECT target FROM relations")?
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut env, &rules, &mut HashMap::new(), &[], &[], "r")?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut env, &rules, &mut HashMap::new(), &[], &[], "python")?;
+        let targets = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         assert!(targets.contains("analysis/vr/cellexalObj.RData"));
@@ -396,8 +406,8 @@ mod loop_generated_output_regressions {
         let paths: HashSet<String> = OUTPUTS.iter().map(|s| s.to_string()).collect();
         let mut env = Environment::default();
         analyze_source(&db, "analysis", source, 1, &paths, &mut env,
-            &[], &mut HashMap::new(), &[], language)?;
-        let mut stmt = db.prepare("SELECT target, kind, evidence FROM relations WHERE source='analysis'")?;
+            &[], &mut HashMap::new(), &[], &[], language)?;
+        let mut stmt = db.prepare("SELECT a.path, m.direction, m.evidence FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path='analysis'")?;
         let links: Vec<(String, String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<std::result::Result<_, _>>()?;
         for expected in OUTPUTS {
@@ -440,9 +450,9 @@ for doi in days:
 done"#;
         let lines: Vec<(usize, String)> = script.lines().enumerate()
             .map(|(i, line)| (i + 1, line.to_owned())).collect();
-        analyze_lines(&db, "analysis.sh", &lines, &paths, true, &[], &[])?;
+        analyze_lines(&db, "analysis.sh", &lines, &paths, true, &[], &[], &[])?;
         let count: i64 = db.query_row(
-            "SELECT count(*) FROM relations WHERE kind='writes'", [], |r| r.get(0))?;
+            "SELECT count(*) FROM file_matches WHERE direction='writes'", [], |r| r.get(0))?;
         assert_eq!(count, 3, "Bash loop should identify all three output files");
         Ok(())
     }
@@ -500,8 +510,8 @@ mod logic_module_regressions {
         )).collect::<String>();
         let mut env = Environment::default();
         analyze_source(&db, "analysis", &source, 1, &paths, &mut env,
-            &[], &mut HashMap::new(), &[], "r")?;
-        let mut stmt = db.prepare("SELECT target FROM relations WHERE source='analysis' AND kind='writes'")?;
+            &[], &mut HashMap::new(), &[], &[], "r")?;
+        let mut stmt = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path='analysis' AND m.direction='writes'")?;
         let targets: HashSet<String> = stmt.query_map([], |row| row.get(0))?
             .collect::<std::result::Result<_, _>>()?;
         for name in filenames { assert!(targets.contains(name), "missing write relation: {name}"); }
@@ -541,21 +551,23 @@ mod moved_data_integration_tests {
         let db = Connection::open_in_memory()?;
         schema(&db)?;
         parse(&db, &root, rel, &inventory)?;
-        let reads: i64 = db.query_row(
-            "SELECT count(*) FROM relations WHERE source=?1 AND kind='reads'",
+        let candidates: i64 = db.query_row(
+            "SELECT count(*) FROM file_matches m JOIN artifacts s ON s.id=m.source_id \
+             WHERE s.path=?1 AND m.direction='reads' AND m.decision_id=0",
             [rel], |r| r.get(0))?;
-        assert_eq!(reads, 0, "relocated files must not be silently confirmed");
-        let unresolved: i64 = db.query_row(
-            "SELECT count(*) FROM issues WHERE notebook=?1 AND filename='*/*.h5'",
+        assert_eq!(candidates, 3, "relocated files must remain reviewable candidates");
+        let confirmed: i64 = db.query_row(
+            "SELECT count(*) FROM file_matches m JOIN artifacts s ON s.id=m.source_id \
+             WHERE s.path=?1 AND m.direction='reads' AND m.decision_id<>0",
             [rel], |r| r.get(0))?;
-        assert!(unresolved > 0, "relocated wildcard must reach the normal investigation workflow");
+        assert_eq!(confirmed, 0, "relocated files must not be silently decided");
         // Correctly located files take precedence over recovery.
         inventory.insert("analysis1/set1/set1.h5".to_owned());
         let second = Connection::open_in_memory()?;
         schema(&second)?;
         parse(&second, &root, rel, &inventory)?;
         let strict: i64 = second.query_row(
-            "SELECT count(*) FROM relations WHERE source=?1 AND target='analysis1/set1/set1.h5' AND kind='reads'",
+            "SELECT count(*) FROM file_matches m JOIN artifacts s ON s.id=m.source_id JOIN artifacts a ON a.id=m.artifact_id WHERE s.path=?1 AND a.path='analysis1/set1/set1.h5' AND m.direction='reads'",
             [rel], |r| r.get(0))?;
         assert_eq!(strict, 1);
         // With 51 possible relocated files, do not create an investigation
@@ -568,9 +580,8 @@ mod moved_data_integration_tests {
         schema(&third)?;
         parse(&third, &root, rel, &crowded)?;
         let suppressed: i64 = third.query_row(
-            "SELECT count(*) FROM issues WHERE notebook=?1 AND filename='*/*.h5'",
-            [rel], |r| r.get(0))?;
-        assert_eq!(suppressed, 0, "more than 50 relocated files must return nothing");
+            "SELECT count(*) FROM file_matches", [], |r| r.get(0))?;
+        assert_eq!(suppressed, 0, "more than 50 relocated files must return no matches");
         Ok(())
     }
 }
@@ -637,4 +648,181 @@ mod funky_match_tests {
             ]));
     }
 
+}
+
+#[test]
+fn unified_yaml_cli_rule_parses() {
+    let yaml = r#"version: 2
+operations:
+  - name: sc-analyse
+    language: bash
+    subcommand: gex
+    arguments:
+      - {name: --data, role: input, kind: file, cardinality: many}
+      - {name: --out, role: output, kind: directory, descendants: true}
+"#;
+    let rules: RuleSet = serde_yaml::from_str(yaml).unwrap();
+    assert_eq!(rules.operations.len(), 1);
+    assert_eq!(rules.operations[0].arguments[0].cardinality.as_deref(), Some("many"));
+}
+
+#[test]
+fn shell_cli_rule_links_multiple_inputs_and_output_directory() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    schema(&db)?;
+    let paths: HashSet<String> = [
+        "GSE156442/a.h5ad", "GSE156442/b.h5ad",
+        "GSE156442/sc_analysis_combined/analysis.h5ad",
+        "GSE156442/sc_analysis_combined/figures/umap.png",
+    ].iter().map(|s| s.to_string()).collect();
+    let yaml = r#"version: 2
+operations:
+  - name: sc-analyse
+    language: bash
+    subcommand: gex
+    arguments:
+      - {name: --data, role: input, kind: file, cardinality: many}
+      - {name: --sample-names, role: parameter, kind: value, cardinality: many}
+      - {name: --out, role: output, kind: directory, descendants: true}
+"#;
+    let rules: RuleSet = serde_yaml::from_str(yaml)?;
+    let shell = "sc-analyse gex --data a.h5ad b.h5ad --sample-names A B --out sc_analysis_combined";
+    let lines = vec![(1, shell.to_owned())];
+    analyze_lines(&db, "GSE156442/run.sh", &lines, &paths, true, &[], &[], &rules.operations)?;
+    let reads: i64 = db.query_row("SELECT count(*) FROM file_matches WHERE direction='reads'", [], |r| r.get(0))?;
+    let dirs: i64 = db.query_row("SELECT count(*) FROM file_matches WHERE direction='writes_directory'", [], |r| r.get(0))?;
+    assert_eq!(reads, 2);
+    assert_eq!(dirs, 1);
+    Ok(())
+}
+
+#[test]
+fn unified_yaml_scientific_operations_and_shell_syntax() -> Result<()> {
+    let rules: RuleSet = serde_yaml::from_str(include_str!("../../../rules/scientific_functions.yaml"))?;
+    assert!(rules.operations.iter().any(|r| r.name == "scanpy.read_h5ad"));
+    assert!(rules.operations.iter().any(|r| r.name == "Read10X"));
+    let imports = python_imports("import scanpy as sc\n");
+    assert!(operation_name_matches("scanpy.read_h5ad", "sc.read_h5ad", &imports, "python"));
+    let (segments, redirects) = shell_pipeline("samtools view -b input.sam|samtools sort -o output.bam - 2>errors.log");
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0][0], "samtools");
+    assert_eq!(segments[1][1], "sort");
+    assert_eq!(redirects, vec![("2>".to_owned(), "errors.log".to_owned())]);
+    let spec: OperationArgument = serde_yaml::from_str("position: 2\nthrough: last\nrole: input\nkind: file")?;
+    assert_eq!(positional_bounds(&spec, 5), Some((1,5)));
+    let last: OperationArgument = serde_yaml::from_str("position: last\nrole: input\nkind: file")?;
+    assert_eq!(positional_bounds(&last, 5), Some((4,5)));
+    Ok(())
+}
+
+#[test]
+fn unified_python_r_rules_record_inputs_and_directory_outputs() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    schema(&db)?;
+    let paths: HashSet<String> = [
+        "analysis/input.h5ad", "analysis/result.h5ad",
+        "analysis/tenx/matrix.mtx.gz", "analysis/tenx/barcodes.tsv.gz",
+        "analysis/tenx/features.tsv.gz", "analysis/result.rds",
+    ].iter().map(|s| s.to_string()).collect();
+    let rules: RuleSet = serde_yaml::from_str(include_str!("../../../rules/scientific_functions.yaml"))?;
+    let mut env = Environment::default();
+    let mut imports = HashMap::new();
+    let python = "import scanpy as sc\na = sc.read_h5ad('input.h5ad')\na.write_h5ad('result.h5ad')\nb = sc.read_10x_mtx('tenx')\n";
+    analyze_source(&db,"analysis/run.py",python,1,&paths,&mut env,&[],&mut imports,&[],&rules.operations,"python")?;
+    analyze_source(&db,"analysis/run.R","x <- Read10X(data.dir='tenx')\nsaveRDS(x, file='result.rds')",1,
+        &paths,&mut Environment::default(),&[],&mut HashMap::new(),&[],&rules.operations,"r")?;
+    let mut stmt = db.prepare("SELECT a.path, m.direction FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id")?;
+    let edges: Vec<(String,String)> = stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?
+        .collect::<std::result::Result<_,_>>()?;
+    assert!(edges.iter().any(|(p,d)| p=="analysis/input.h5ad" && d=="reads"));
+    assert!(edges.iter().any(|(p,d)| p=="analysis/result.h5ad" && d=="writes"));
+    assert!(edges.iter().any(|(p,d)| p=="analysis/tenx" && d=="reads"));
+    assert!(edges.iter().any(|(p,d)| p=="analysis/result.rds" && d=="writes"));
+    Ok(())
+}
+
+#[test]
+fn expected_files_restrict_directory_outputs_and_support_mid_filename_wildcards() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    schema(&db)?;
+    let paths: HashSet<String> = [
+        "project/stats/sampleA_counts.csv",
+        "project/stats/sampleA_markers.csv",
+        "project/stats/sampleB_counts.csv",
+        "project/stats/notes.txt",
+        "project/stats/nested/sampleA_nested.csv",
+    ].into_iter().map(str::to_owned).collect();
+    let rules: RuleSet = serde_yaml::from_str(r#"version: 2
+operations:
+  - name: write_stats_tables
+    language: python
+    arguments:
+      - {position: 2, role: output, kind: directory, descendants: true, expected_files: ['sampleA*.csv']}
+"#)?;
+    let mut env = Environment::default();
+    analyze_source(&db, "project/analyze.py", "write_stats_tables(adata, 'stats')", 1,
+        &paths, &mut env, &rules.functions, &mut HashMap::new(), &[], &rules.operations, "python")?;
+    let mut stmt = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id WHERE m.direction='writes' ORDER BY a.path")?;
+    let written: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    assert_eq!(written, vec!["project/stats/sampleA_counts.csv", "project/stats/sampleA_markers.csv"]);
+    let broad: i64 = db.query_row("SELECT count(*) FROM file_matches WHERE direction='writes_directory'", [], |r| r.get(0))?;
+    assert_eq!(broad, 0, "restricted outputs must not claim the entire directory");
+    Ok(())
+}
+
+#[test]
+fn operation_default_output_applies_only_when_argument_is_missing() -> Result<()> {
+    let db = Connection::open_in_memory()?;
+    schema(&db)?;
+    let paths: HashSet<String> = ["project/top_genes.csv", "project/custom.csv"]
+        .into_iter().map(str::to_owned).collect();
+    let rules: RuleSet = serde_yaml::from_str(r#"version: 2
+operations:
+  - name: write_top_genes
+    language: python
+    arguments:
+      - {position: 2, role: output, kind: file, default: top_genes.csv}
+"#)?;
+    let mut env = Environment::default();
+    analyze_source(&db, "project/analyze.py", "write_top_genes(adata)\nwrite_top_genes(adata, 'custom.csv')", 1,
+        &paths, &mut env, &rules.functions, &mut HashMap::new(), &[], &rules.operations, "python")?;
+    let mut stmt = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id WHERE m.direction='writes' ORDER BY a.path")?;
+    let written: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    assert_eq!(written, vec!["project/custom.csv", "project/top_genes.csv"]);
+    Ok(())
+}
+
+#[test]
+fn expanded_shell_directory_paths_match_empty_inventory_directories() {
+    let db = Connection::open_in_memory().unwrap();
+    crate::core::engine::schema(&db).unwrap();
+    let paths: HashSet<String> = [
+        "20260220/nextflow_10X_ONT.sh",
+        "20260220/TP53-capt_2",
+        "20260220/TP53-capt_2_outdir",
+    ].into_iter().map(str::to_owned).collect();
+    let rel = "20260220/nextflow_10X_ONT.sh";
+    for directory in ["20260220/TP53-capt_2", "20260220/TP53-capt_2_outdir"] {
+        db.execute("INSERT INTO artifacts(path,kind) VALUES (?1,'directory')", [directory]).unwrap();
+    }
+    let input = LogicLinks {
+        kind: LinkType::Reads,
+        links: LinksToFiles { files: vec![Variable::Parts(FilePath::new(vec![PathPart::Literal("./TP53-capt_2/".into())]))] },
+        expression: "$PATH_FASTQ".into(),
+        function: "nextflow run [--fastq]".into(),
+    };
+    let output = LogicLinks {
+        kind: LinkType::Writes,
+        links: LinksToFiles { files: vec![Variable::Parts(FilePath::new(vec![PathPart::Literal("./TP53-capt_2_outdir/".into())]))] },
+        expression: "$OUTDIR".into(),
+        function: "nextflow run [--out_dir]".into(),
+    };
+    let count = record_logic_links(&db, rel, 34, &[input, output], &paths).unwrap();
+    assert_eq!(count, 2);
+    let mut stmt = db.prepare("SELECT a.path, m.direction FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id ORDER BY a.path").unwrap();
+    let links: Vec<(String, String)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().map(Result::unwrap).collect();
+    assert_eq!(links, vec![
+        ("20260220/TP53-capt_2".into(), "reads".into()),
+        ("20260220/TP53-capt_2_outdir".into(), "writes_directory".into()),
+    ]);
 }

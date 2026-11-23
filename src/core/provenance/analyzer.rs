@@ -1,10 +1,10 @@
 use super::*;
-pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,env:&mut Environment,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule], language:&str)->Result<usize> {
+pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize,paths:&HashSet<String>,env:&mut Environment,rules:&[FunctionRule], imports:&mut HashMap<String,String>, plots:&[PlotRule], operation_rules:&[OperationRule], language:&str)->Result<usize> {
     let assign=Regex::new(r#"^\s*(?:export\s+)?([A-Za-z_][\w.]*)\s*(?:<-|=)\s*(.*?)\s*$"#)?;
     let mut count=0;
     let linkers = LinkerRegistry::new(rules, language);
     imports.extend(python_imports(source));
-    let ops=operations(source,rules,imports,plots,language);
+    let ops=operations(source,rules,imports,plots,operation_rules,language);
     // Assignments are tracked in source order, but unresolved assignments
     // invalidate earlier values rather than retaining stale provenance.
     let mut assignments:Vec<(usize,String,String)>=Vec::new();
@@ -39,6 +39,9 @@ pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize
                 count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, env, paths, plots)?;
             }
             let name=if language == "r" { label.as_str() } else { label.rsplit('.').next().unwrap_or(label) };
+            for rule in operation_rules.iter().filter(|r|r.language==language && operation_name_matches(&r.name, label, imports, language)) {
+                count += apply_function_operation(db, rel, line_base+line-1, args, rule, env, paths)?;
+            }
             for rule in rules.iter().filter(|r|r.name==name && r.language==language) {
                 count+=apply_rule(db,rel,line_base+line-1,args,rule,env,paths)?;
             }
@@ -57,6 +60,8 @@ pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize
                 scoped.variables.insert(c[1].to_owned(), value.clone());
             }
         }
+        // YAML adds explicit argument semantics; it must never disable the
+        // existing symbolic matcher (including notebook wildcard propagation).
         let module_links = if balanced { linkers.matches(&format!("{label}({args})"), &scoped) } else { Vec::new() };
         count += record_logic_links(db, rel, line_base+line-1, &module_links, paths)?;
         // Compatibility path for malformed calls and specialized legacy cases.
@@ -66,7 +71,7 @@ pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize
         let mut candidates = if module_links.is_empty() || needs_mex_expansion { filename_args(label,args,env) } else { Vec::new() };
         // Only use the fragment fallback when the existing exact resolver
         // found no filename argument. Candidates stay in Build / Repair.
-        if candidates.is_empty() && balanced {
+        if candidates.is_empty() && balanced && module_links.is_empty() {
             fragment_candidates(db,rel,line_base+line-1,label,args,env,paths)?;
         }
         // A malformed call may have a complete filename literal followed by
@@ -161,11 +166,27 @@ pub(super) fn shell_expand(text: &str, env: &Environment) -> Variable {
     Variable::Parts(FilePath::new(parts))
 }
 
-pub(super) fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule],plots:&[PlotRule])->Result<usize> {
+pub(super) fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],paths:&HashSet<String>,shell:bool,rules:&[FunctionRule],plots:&[PlotRule],operation_rules:&[OperationRule])->Result<usize> {
     let mut env=Environment::default();let mut count=0;
     if shell {
         let mut loop_variable: Option<(String, Vec<String>)> = None;
-        for (line,raw) in lines {
+        let mut logical_lines = Vec::<(usize, String)>::new();
+        let mut continued: Option<(usize, String)> = None;
+        for (line, raw) in lines {
+            let trimmed = raw.trim_end();
+            if let Some(part) = trimmed.strip_suffix('\\') {
+                let (first, mut text) = continued.take().unwrap_or((*line, String::new()));
+                text.push_str(part);
+                text.push(' ');
+                continued = Some((first, text));
+            } else if let Some((first, mut text)) = continued.take() {
+                text.push_str(trimmed);
+                logical_lines.push((first, text));
+            } else { logical_lines.push((*line, raw.clone())); }
+        }
+        if let Some(unfinished) = continued { logical_lines.push(unfinished); }
+        let mut cwd: Option<String> = None;
+        for (line,raw) in &logical_lines {
             let raw = raw.trim();
             if let Some(values) = shell_loop_values(raw) {
                 loop_variable = Some(values);
@@ -198,6 +219,20 @@ pub(super) fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],path
                 }
             }
             let tokens=shell_tokens(raw);
+            if tokens.first().map(String::as_str) == Some("cd") {
+                cwd = tokens.get(1).cloned();
+                continue;
+            }
+            let (segments, redirects) = shell_pipeline(raw);
+            for segment in &segments {
+                count += apply_shell_operation(db, rel, *line, segment, operation_rules, &env, paths, cwd.as_deref())?;
+            }
+            // Shell redirections are not tool-specific. A pipe connects the
+            // operations without inventing a physical intermediate artifact.
+            for (operator, path) in &redirects {
+                let hint = if operator.contains('<') { "read" } else { "write" };
+                count += match_candidate(db, rel, *line, &format!("'{path}'"), hint, &env, paths, false)?;
+            }
             if tokens.first().map(String::as_str)==Some("cp") && tokens.len()>=3 {
                 for src in &tokens[1..tokens.len()-1] {count+=match_candidate(db,rel,*line,&format!("'{src}'"),"read",&env,paths,false)?;}
                 count+=match_candidate(db,rel,*line,&format!("'{}'",tokens.last().unwrap()),"write",&env,paths,false)?;
@@ -221,14 +256,14 @@ pub(super) fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],path
                             }
                             if let Variable::Parts(path) = shell_expand(output, &local) {
                                 for target in paths.iter().filter(|p| path.matches(p)) {
-                                    add_relation(db, rel, target, "writes", &format!("{rel}: line {line}: shell loop redirection"), false)?;
+                                    super::super::history_db::DbProvenance::record_match(db, rel, *line, output, target, "writes", &format!("{rel}: line {line}: shell loop redirection"))?;
                                     count += 1;
                                 }
                             }
                         }
                     } else if let Variable::Parts(path) = shell_expand(output, &env) {
                         for target in paths.iter().filter(|p| path.matches(p)) {
-                            add_relation(db, rel, target, "writes", &format!("{rel}: line {line}: shell redirection"), false)?;
+                            super::super::history_db::DbProvenance::record_match(db, rel, *line, output, target, "writes", &format!("{rel}: line {line}: shell redirection"))?;
                             count += 1;
                         }
                     }
@@ -240,7 +275,7 @@ pub(super) fn analyze_lines(db:&Connection,rel:&str,lines:&[(usize,String)],path
     let mut source=String::new();
     for (_,line) in lines {source.push_str(line);source.push('\n');}
     let language=if is_r_source(rel, &source) {"r"} else {"python"};
-    count+=analyze_source(db,rel,&source,1,paths,&mut env,rules,&mut HashMap::new(),plots,language)?;
+    count+=analyze_source(db,rel,&source,1,paths,&mut env,rules,&mut HashMap::new(),plots,operation_rules,language)?;
     Ok(count)
 }
 // Notebook files are containers: the kernel, not .ipynb, determines syntax.

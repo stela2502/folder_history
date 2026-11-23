@@ -7,11 +7,21 @@ pub(super) enum PathPart {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct FilePath {
+pub struct FilePath {
     pub(super) parts: Vec<PathPart>,
 }
 
 impl FilePath {
+    /// Construct a filename search pattern using the same symbolic path parts
+    /// and matching semantics as provenance and YAML expected_files.
+    pub fn from_search_pattern(pattern: &str) -> Self {
+        let mut parts = Vec::new();
+        for (index, fragment) in pattern.split('*').enumerate() {
+            if index != 0 { parts.push(PathPart::Wildcard); }
+            if !fragment.is_empty() { parts.push(PathPart::Literal(fragment.to_owned())); }
+        }
+        Self::new(parts)
+    }
     pub(super) fn new(parts: Vec<PathPart>) -> Self {
         let mut normalized: Vec<PathPart> = Vec::new();
         for part in parts {
@@ -32,6 +42,38 @@ impl FilePath {
             }
         }
         Self { parts: normalized }
+    }
+
+    /// Reuse the provenance expression parser for an unresolved filename.
+    /// A literal anchor is required before suggesting physical candidates.
+    pub fn from_issue_expression(expression: &str) -> Option<Self> {
+        // Older issue records may have lost the opening quote of a concat.
+        let restored;
+        let expression = if !expression.starts_with(['"', '\''])
+            && expression.contains("\"+") && expression.contains("+\"") {
+            restored = format!("\"{expression}");
+            restored.as_str()
+        } else { expression };
+        let path = Variable::from_script_slice(expression, &Environment::default(), "")
+            .into_filepath();
+        if !path.contains_wildcards() { return None; }
+        if !path.parts.iter().any(|part| matches!(part, PathPart::Literal(s)
+            if s.chars().any(|c| c.is_alphanumeric()))) { return None; }
+        Some(path)
+    }
+
+    /// Full relative-path matching for indexed search results.
+    pub fn matches_search_path(&self, path: &str) -> bool {
+        self.matches(path)
+    }
+
+    pub fn matches_filename(&self, physical_path: &str) -> bool {
+        let normalized = physical_path.replace('\\', "/");
+        self.matches(normalized.rsplit('/').next().unwrap_or(&normalized))
+    }
+
+    pub(super) fn contains_wildcards(&self) -> bool {
+        self.parts.iter().any(|part| matches!(part, PathPart::Wildcard))
     }
 
     pub(super) fn matches<S: AsRef<str>>(&self, candidate: S) -> bool {
@@ -80,7 +122,16 @@ impl FilePath {
     }
 
     pub(super) fn find_matches(&self, source: &str, paths: &HashSet<String>) -> FileMatches {
+        let mut ignored = Vec::new();
+        self.find_matches_with_trace(source, paths, &mut ignored)
+    }
+
+    /// The diagnostic uses the exact same matching implementation and records
+    /// which stages were attempted; no second matching algorithm is involved.
+    pub(super) fn find_matches_with_trace(&self, source: &str, paths: &HashSet<String>,
+        trace: &mut Vec<String>) -> FileMatches {
         const MAX_CANDIDATES: usize = 50;
+        trace.push(format!("search: source={source:?}, indexed candidates={}", paths.len()));
         let dir = source.replace('\\', "/");
         let dir = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let mut strict: Vec<String> = paths.iter().filter(|candidate| {
@@ -89,7 +140,12 @@ impl FilePath {
             local.is_some_and(|p| self.matches(p))
         }).cloned().collect();
         strict.sort();
-        if !strict.is_empty() { return FileMatches::Strict(strict); }
+        trace.push(format!("strict: searched paths relative to source directory {dir:?}; matches={}", strict.len()));
+        if !strict.is_empty() {
+            trace.push("fuzzy: SKIPPED because strict matching succeeded".into());
+            return FileMatches::Strict(strict);
+        }
+        trace.push("fuzzy: ATTEMPTING ancestor-shift relocation (suggestions only)".into());
 
         // Keep the complete path pattern and move its anchor to any ancestor.
         // Rank by the number of discarded leading directory components: the
@@ -107,20 +163,29 @@ impl FilePath {
                 }
             }
         }
-        if let Some((_, mut found)) = by_shift.into_iter().next() {
-            if found.len() > MAX_CANDIDATES { return FileMatches::None; }
+        if let Some((shift, mut found)) = by_shift.into_iter().next() {
+            trace.push(format!("fuzzy ancestor-shift: shift={shift}, candidates={}", found.len()));
+            if found.len() > MAX_CANDIDATES {
+                trace.push(format!("fuzzy: REJECTED, more than {MAX_CANDIDATES} candidates"));
+                return FileMatches::None;
+            }
             found.sort();
             return FileMatches::Funky(found);
         }
 
+        trace.push("fuzzy ancestor-shift: no matches; trying basename relocation".into());
         // Last resort: retain the entire basename pattern, not just extension.
         let mut funky = Vec::new();
         for candidate in paths {
             if self.funky_match(candidate) {
                 funky.push(candidate.clone());
-                if funky.len() > MAX_CANDIDATES { return FileMatches::None; }
+                if funky.len() > MAX_CANDIDATES {
+                    trace.push(format!("fuzzy basename: REJECTED, more than {MAX_CANDIDATES} candidates"));
+                    return FileMatches::None;
+                }
             }
         }
+        trace.push(format!("fuzzy basename: matches={}", funky.len()));
         if funky.is_empty() { FileMatches::None } else {
             funky.sort();
             FileMatches::Funky(funky)
@@ -150,6 +215,7 @@ pub(super) enum Variable {
 }
 
 impl Variable {
+    #[allow(dead_code)] // Used by diagnostic tests; production code calls matches().
     pub(super) fn match_as_str(&self, candidate: &str) -> bool {
         self.matches(candidate)
     }
@@ -172,6 +238,23 @@ impl Variable {
 
     pub(super) fn from_script_slice(source: &str, env: &Environment, _language: &str) -> Self {
         let source = source.trim();
+        // Concatenated filename fragments: preserve exact literal boundaries.
+        // Split only at top-level `+`, never inside quotes or indexing/calls.
+        // This handles Python, JavaScript and similar expressions without
+        // interpreting the dynamic component (including nested quoted keys).
+        if let Some(terms) = top_level_concat_terms(source) {
+            let mut parts = Vec::new();
+            for term in terms {
+                if let Some(literal) = quoted_literal(term) {
+                    parts.push(PathPart::Literal(literal));
+                } else if let Some(exact) = Self::resolve_exact(term, env) {
+                    parts.push(PathPart::Literal(exact));
+                } else {
+                    parts.push(PathPart::Wildcard);
+                }
+            }
+            return Self::Parts(FilePath::new(parts));
+        }
         if let Some(exact) = Self::resolve_exact(source, env) {
             return Self::Exact(exact);
         }
@@ -248,6 +331,59 @@ impl Variable {
         }
         Self::Parts(FilePath::new(parts))
     }
+}
+
+
+// Recognize an entire quoted literal, not just a string that happens to
+// start and end with quotation marks around an embedded expression.
+fn quoted_literal(term: &str) -> Option<String> {
+    let term = term.trim();
+    let mut chars = term.char_indices();
+    let (_, quote) = chars.next()?;
+    if quote != '\'' && quote != '"' { return None; }
+    let mut escaped = false;
+    let mut value = String::new();
+    for (idx, ch) in chars {
+        if escaped { value.push(ch); escaped = false; continue; }
+        if ch == '\\' { escaped = true; continue; }
+        if ch == quote {
+            return (idx + ch.len_utf8() == term.len()).then_some(value);
+        }
+        value.push(ch);
+    }
+    None
+}
+
+fn top_level_concat_terms(source: &str) -> Option<Vec<&str>> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut terms = Vec::new();
+    for (i, ch) in source.char_indices() {
+        if escaped { escaped = false; continue; }
+        if let Some(q) = quote {
+            if ch == '\\' { escaped = true; }
+            else if ch == q { quote = None; }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '+' if depth == 0 => {
+                terms.push(source[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if terms.is_empty() { return None; }
+    terms.push(source[start..].trim());
+    if terms.iter().any(|term| term.is_empty()) { return None; }
+    // Don't mistake arithmetic for a filename expression.
+    if !terms.iter().any(|term| quoted_literal(term).is_some()) { return None; }
+    Some(terms)
 }
 
 // Extract a wildcard *filename* from any function's quoted arguments, without

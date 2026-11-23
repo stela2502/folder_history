@@ -1,422 +1,219 @@
-//! File-first classification. Source code is optional evidence, not the question.
+//! Database-backed scientist review: no matching or SQL in the GUI.
 use crate::*;
-use super::app::{App, open_indexed_file};
+use folder_history::core::history_db::{DbArchiveView, DbIssues, MatchDecision, WizardInternals};
+use std::collections::HashSet;
+use folder_history::core::ArtifactRole;
+use super::app::{App, open_indexed_file, open_indexed_entry};
 
-#[derive(Clone)]
-struct Candidate { path: String, variable: String, folder: bool }
-
-fn looks_like_path(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(char::is_control)
-        && !matches!(value, "\\t" | "\\n" | "\\r") && !value.contains("://")
-        && (value.contains('/') || value.contains('\\') || Path::new(value).extension().is_some())
-}
-
-// Extract only simple literal assignments. Other syntax belongs to language
-// adapters; this function never claims to reconstruct execution order.
-fn assignment(line: &str) -> Option<(String, String)> {
-    let (lhs, rhs) = line.trim().split_once('=')?;
-    let lhs = lhs.trim();
-    if lhs.is_empty() || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        || lhs.chars().next()?.is_ascii_digit() { return None; }
-    let rhs = rhs.trim();
-    let quote = rhs.chars().next()?;
-    if quote != '\'' && quote != '"' { return None; }
-    let value = rhs[1..].split(quote).next()?;
-    if !looks_like_path(value) { return None; }
-    Some((lhs.to_owned(), value.to_owned()))
-}
-
-// Only indexed physical artifacts can be classified. Symbolic expressions
-// remain investigation evidence; they are never displayed as file rows.
-fn candidates(source: &str, issues: &[Issue], db: Option<&Connection>) -> Vec<Candidate> {
-    let Some(db) = db else { return Vec::new(); };
-    let paths: HashSet<String> = match db.prepare("SELECT path FROM artifacts") {
-        Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    let mut found: BTreeMap<String, Candidate> = BTreeMap::new();
-    // Existing confirmed/inferred read and write edges are authoritative
-    // candidates for review, including wildcard-expanded H5 files.
-    if let Ok(mut stmt) = db.prepare(
-        "SELECT target FROM relations WHERE source=?1 AND kind IN ('reads','writes','writes_directory')"
-    ) {
-        if let Ok(rows) = stmt.query_map(params![source], |r| r.get::<_, String>(0)) {
-            for path in rows.flatten() {
-                if paths.contains(&path) {
-                    found.entry(path.clone()).or_insert(Candidate {
-                        folder: false, path, variable: String::new(),
-                    });
-                }
-            }
-        }
-    }
-    // An unresolved issue may also refer to a real file, but only after
-    // unambiguous resolution against the inventory.
-    for issue in issues.iter().filter(|i| i.notebook == source) {
-        if let Some(path) = engine::classified_artifact_path(&issue.filename, source, &paths) {
-            found.entry(path.clone()).or_insert(Candidate {
-                folder: false, path, variable: String::new(),
-            });
-        }
-    }
-    if let Ok(mut stmt) = db.prepare("SELECT DISTINCT path FROM relocation_candidates WHERE source=?1") {
-        if let Ok(rows) = stmt.query_map(params![source], |r| r.get::<_, String>(0)) {
-            for path in rows.flatten() {
-                if paths.contains(&path) {
-                    found.entry(path.clone()).or_insert(Candidate {
-                        folder: false, path,
-                        variable: "Possible relocated file (unverified)".into(),
-                    });
-                }
-            }
-        }
-    }
-    found.into_values().collect()
-}
-// Classifications resolve investigation questions, not unverified read/write edges.
-fn matches_issue_path(issue_path: &str, candidate_path: &str) -> bool {
-    let issue = issue_path.replace('\\', "/");
-    let candidate = candidate_path.replace('\\', "/");
-    let issue = issue.trim_end_matches('/');
-    let candidate = candidate.trim_end_matches('/');
-    issue == candidate || issue.ends_with(&format!("/{candidate}"))
-        || candidate.ends_with(&format!("/{issue}"))
-}
-
-// Only the selected script is eligible. A short filename must identify exactly
-// one candidate; otherwise we must not resolve an unrelated file by accident.
-fn resolve_classified_issues(tx: &rusqlite::Transaction<'_>, source: &str, items: &[Candidate]) -> Result<usize> {
-    let mut changed = 0;
-    let mut stmt = tx.prepare("SELECT rowid, filename FROM issues WHERE notebook=?1 AND decision='open'")?;
-    let rows: Vec<(i64, String)> = stmt.query_map(params![source], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(stmt);
-    for (rowid, filename) in rows {
-        let matches = items.iter().filter(|item| matches_issue_path(&filename, &item.path)).count();
-        if matches == 1 {
-            changed += tx.execute(
-                "UPDATE issues SET decision='classified', note='Scientist confirmed file/folder classification' WHERE rowid=?1 AND decision='open'",
-                params![rowid],
-            )?;
-        }
-    }
-    Ok(changed)
-}
-
-fn suggestion(variable: &str) -> &'static str {
-    match variable.to_ascii_lowercase().as_str() {
-        "raw" => "Intermediate raw data",
-        "analyzed" | "analysed" => "Analyzed data",
-        _ => "Unknown",
-    }
-}
-
-// Existing labels remain selectable so saved classifications are not lost.
-const ROLES: &[&str] = &[
-    "Unknown",
-    "Raw experimental data", "Processed data", "Sample metadata",
-    "Reference data", "Configuration / parameters", "Result files",
-    "Results folder", "Figures & images", "Other scientific data", "Not relevant",
-    // Legacy labels retained for existing databases.
-    "Input data", "Other Input Files", "Intermediate raw data",
-    "Preprocessed data", "Analyzed data", "Quantification results",
-];
-
-// Apply a chosen classification to every candidate in this script.
-// This changes only pending UI choices; CONFIRM ALL persists them atomically.
-fn set_all_roles(choices: &mut HashMap<String, String>, source: &str, items: &[Candidate], role: &str) {
-    for item in items {
-        choices.insert(format!("{source}\0{}", item.path), role.to_owned());
-    }
-}
 
 impl App {
     pub(super) fn draw_investigation(&mut self, ui: &mut egui::Ui) {
         let Some((_, selected)) = self.active_dependency.clone() else { self.wizard_mode = false; return; };
         let Some(root) = self.root.clone() else { self.wizard_mode = false; return; };
-        let _ = &root; // Retain the selected analysis root for subsequent recovery UI.
+        let source = if selected == "<script review>" {
+            Some(self.wizard_source.clone())
+        } else {
+            self.issues.get(self.wizard_index)
+                .filter(|i| i.filename == selected)
+                .map(|i| i.notebook.clone())
+        };
+        let Some(source) = source else { ui.label("No source script recorded for this reference."); return; };
         ui.horizontal(|ui| {
             if ui.button("← Back to overview").clicked() { self.wizard_mode = false; }
             ui.separator(); ui.heading("File & folder classification");
         });
-        let source = self.issues.get(self.wizard_index)
-            .filter(|i| i.filename == selected)
-            .map(|i| i.notebook.clone());
-        let Some(source) = source else { ui.label("No source script recorded for this reference."); return; };
-        ui.label(&source);
-        ui.separator();
-        let items = candidates(&source, &self.issues, self.db.as_ref());
-        if items.is_empty() { ui.label("No classifiable files or folders found in this script."); return; }
-        let mut saved: HashMap<String, String> = HashMap::new();
-        if let Some(db) = &self.db {
-            if let Ok(mut stmt) = db.prepare("SELECT path,role FROM file_classifications WHERE source=?1") {
-                if let Ok(rows) = stmt.query_map(params![&source], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
-                    for row in rows.flatten() { saved.insert(row.0, row.1); }
+        ui.label(&source).on_hover_text(root.join(&source).display().to_string());
+        if self.wizard_source != source || self.wizard_data.is_none() {
+            self.wizard_source = source.clone();
+            self.wizard_data = None;
+            self.classification_errors.clear();
+            let result = self.db.as_ref().ok_or_else(|| anyhow::anyhow!("No database"))
+                .and_then(|db| {
+                    let id = db.source_artifact_id(&source)?;
+                    db.issues(id)
+                });
+            match result {
+                Ok(data) => self.wizard_data = Some(data),
+                Err(e) => { ui.colored_label(egui::Color32::RED, format!("Cannot load script matches: {e:#}")); return; }
+            }
+        }
+        if let Some(data) = self.wizard_data.as_mut() {
+            if let Some(path) = show_wizard_data(ui, data, &self.classification_errors) {
+                if let Err(e) = open_indexed_entry(&root, &path) {
+                    self.status = format!("Cannot open entry: {e}");
                 }
             }
         }
-        // Resolve each reference to a unique indexed artifact and reuse its
-        // confirmed role, regardless of which notebook is being investigated.
-        // A matching basename alone is not sufficient when paths are ambiguous.
-        let shared_roles = self.db.as_ref().and_then(|db| {
-            let mut stmt = db.prepare("SELECT path FROM artifacts").ok()?;
-            let paths = stmt.query_map([], |r| r.get::<_, String>(0)).ok()?
-                .collect::<rusqlite::Result<HashSet<_>>>().ok()?;
-            let roles = engine::confirmed_roles(db).ok()?;
-            Some((paths, roles))
-        });
-        for item in &items {
-            let key = format!("{source}\0{}", item.path);
-            let shared = shared_roles.as_ref().and_then(|(paths, roles)| {
-                let path = engine::classified_artifact_path(&item.path, &source, paths)?;
-                roles.get(&path).cloned()
-            });
-            self.classification_choices.entry(key).or_insert_with(|| {
-                shared.or_else(|| saved.get(&item.path).cloned())
-                    .unwrap_or_else(|| suggestion(&item.variable).to_owned())
-            });
-        }
-        let unknown = items.iter().filter(|item| {
-            self.classification_choices.get(&format!("{source}\0{}", item.path))
-                .is_none_or(|role| role == "Unknown")
-        }).count();
-        ui.label(format!("Found {} files/folders · {} classified · {} remaining", items.len(), items.len() - unknown, unknown));
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical().max_height((ui.available_height() - 230.0).max(120.0)).show(ui, |ui| {
-            egui::Grid::new("file_classification_grid").striped(true).min_col_width(55.0).show(ui, |ui| {
-                ui.strong("File / folder"); ui.strong("Variable"); ui.strong("Select"); ui.strong("Classification"); ui.end_row();
-                for item in &items {
-                    let key = format!("{source}\0{}", item.path);
-                    ui.label(format!("{} {}", if item.folder { "📁" } else { "📄" }, item.path));
-                    ui.label(if item.variable.is_empty() { "—" } else { &item.variable });
-                    ui.checkbox(self.classification_selected.entry(key.clone()).or_insert(true), "");
-                    let choice = self.classification_choices.get_mut(&key).expect("initialized above");
-                    egui::ComboBox::from_id_salt(("file_role", &key)).selected_text(choice.as_str())
-                        .show_ui(ui, |ui| { for role in ROLES { ui.selectable_value(choice, (*role).to_owned(), *role); } });
-                    ui.end_row();
-                }
-            });
-        });
-        ui.add_space(12.0);
-        // A horizontal layout gives the frame its natural content width,
-        // instead of stretching it to the table or available window width.
+
+        let mut confirm = false;
         ui.horizontal(|ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::from_gray(38))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(58)))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::same(12))
-                .show(ui, |ui| {
-                    // Keep selection and classification as two distinct rows.
-                    // The outer horizontal layout lets the frame hug its contents.
-                    ui.vertical(|ui| {
-                    ui.strong("Bulk classification");
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Select all").clicked() {
-                            for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), true); }
+            confirm = ui.add_sized([170.0, 34.0], egui::Button::new("✓ CONFIRM ALL")).clicked();
+            if ui.add_sized([170.0, 34.0], egui::Button::new("📂 OPEN SCRIPT")).clicked() {
+                if let Err(e) = open_indexed_file(&root, &source) {
+                    self.status = format!("Cannot open script: {e}");
+                }
+            }
+        });
+
+        if confirm {
+            if let Some(data) = self.wizard_data.as_ref() {
+                let errors = data.validate();
+                if !errors.is_empty() {
+                    self.classification_errors = errors.into_iter()
+                        .map(|(id, msg)| (id.to_string(), msg)).collect();
+                    self.status = format!("{} invalid selections", self.classification_errors.len());
+                } else {
+                    self.classification_errors.clear();
+                    let result = self.db.as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("No writable index"))
+                        .and_then(|db| db.save_wizard(data));
+                    match result {
+                        Ok(()) => {
+                            self.status = "Saved connection decisions and global file roles".into();
+                            self.wizard_mode = false;
+                            self.wizard_data = None;
+                            self.active_dependency = None;
+                            self.refresh();
                         }
-                        if ui.button("Select none").clicked() {
-                            for item in &items { self.classification_selected.insert(format!("{source}\0{}", item.path), false); }
-                        }
-                        if ui.button("Invert selection").clicked() {
-                            for item in &items {
-                                let key = format!("{source}\0{}", item.path);
-                                let current = self.classification_selected.get(&key).copied().unwrap_or(true);
-                                self.classification_selected.insert(key, !current);
-                            }
-                        }
-                        let selected_count = items.iter().filter(|item| self.classification_selected.get(&format!("{source}\0{}", item.path)).copied().unwrap_or(true)).count();
-                        ui.label(format!("{selected_count}/{} selected", items.len()));
-                    });
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                    ui.label("Set selected files/folders to:");
-                    egui::ComboBox::from_id_salt("bulk_file_role")
-                        .selected_text("Choose classification…")
+                        Err(e) => self.status = format!("Cannot save wizard: {e:#}"),
+                    }
+                }
+            }
+        }
+        ui.label(&self.status);
+    }
+}
+
+/// Render only in-memory review data; bulk selection lives in egui's temporary UI state.
+fn show_wizard_data(
+    ui: &mut egui::Ui,
+    data: &mut WizardInternals,
+    errors: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    // One visible row per physical artifact. Keep every occurrence in WizardInternals
+    // so saving still updates every file_matches record, including hidden repeats.
+    let mut seen = HashSet::new();
+    let visible: Vec<(usize, usize, i64, usize)> = data.groups.iter().enumerate()
+        .flat_map(|(gi, group)| group.matches.iter().enumerate().map(move |(mi, m)| (gi, mi, m.artifact_id)))
+        .filter(|(_, _, artifact_id)| seen.insert(*artifact_id))
+        .map(|(gi, mi, artifact_id)| {
+            let occurrences = data.groups.iter().flat_map(|g| &g.matches)
+                .filter(|m| m.artifact_id == artifact_id).count();
+            (gi, mi, artifact_id, occurrences)
+        }).collect();
+    let state_id = egui::Id::new(("wizard_bulk", data.source_id));
+    let mut selected: HashSet<i64> = ui.ctx().data_mut(|d| d.get_temp(state_id).unwrap_or_default());
+    selected.retain(|id| visible.iter().any(|(_, _, artifact_id, _)| artifact_id == id));
+    let role_id = egui::Id::new(("wizard_bulk_role", data.source_id));
+    let mut bulk_role: String = ui.ctx().data_mut(|d| d.get_temp(role_id).unwrap_or_else(|| "Unknown".to_owned()));
+    let total: usize = data.groups.iter().map(|g| g.matches.len()).sum();
+    ui.label(format!("{} unique files · {total} recorded occurrences", visible.len()));
+    ui.separator();
+
+    ui.group(|ui| {
+        ui.strong("Bulk classification");
+        ui.horizontal(|ui| {
+            if ui.button("Select all").clicked() {
+                selected = visible.iter().map(|(_, _, id, _)| *id).collect();
+            }
+            if ui.button("Invert selection").clicked() {
+                for (_, _, id, _) in &visible {
+                    if !selected.insert(*id) { selected.remove(id); }
+                }
+            }
+            if ui.button("Clear selection").clicked() { selected.clear(); }
+            ui.label(format!("{} selected", selected.len()));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Set selected files/folders to:");
+            egui::ComboBox::from_id_salt(("wizard_bulk_role", data.source_id))
+                .selected_text(&bulk_role)
+                .show_ui(ui, |ui| {
+                    for role in ArtifactRole::dropdown() { ui.selectable_value(&mut bulk_role, role.label().to_owned(), role.label()); }
+                });
+            if ui.button("Apply to selected").clicked() {
+                for item in data.groups.iter_mut().flat_map(|g| &mut g.matches) {
+                    if selected.contains(&item.artifact_id) { set_classification(item, &bulk_role); }
+                }
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    // Collect edits first, then propagate them to *all* occurrences of each file.
+    // Never delete or merge persisted provenance evidence.
+    let mut changes: Vec<(i64, String)> = Vec::new();
+    let mut open_entry: Option<String> = None;
+    egui::ScrollArea::vertical().max_height((ui.available_height()-180.0).max(120.0)).show(ui, |ui| {
+        for (title, reads) in [("Files read by the script:", true), ("Files created by the script:", false)] {
+            ui.heading(title);
+            for &(gi, mi, artifact_id, occurrences) in &visible {
+                let group = &data.groups[gi];
+                if (group.direction == "reads") != reads { continue; }
+                let item = &group.matches[mi];
+                ui.horizontal(|ui| {
+                    let mut checked = selected.contains(&artifact_id);
+                    if ui.checkbox(&mut checked, "").changed() {
+                        if checked { selected.insert(artifact_id); } else { selected.remove(&artifact_id); }
+                    }
+                    let short = item.artifact.rsplitn(3, '/').take(2).collect::<Vec<_>>();
+                    let short = short.into_iter().rev().collect::<Vec<_>>().join("/");
+                    if ui.selectable_label(false, short)
+                        .on_hover_text(format!("{}\nDouble-click to open", item.artifact))
+                        .double_clicked() {
+                        open_entry = Some(item.artifact.clone());
+                    }
+                    if occurrences > 1 {
+                        ui.small(format!("{occurrences} occurrences"))
+                            .on_hover_text("All notebook/script occurrences are preserved in the database.");
+                    }
+                    let mut classification = current_classification(item).to_owned();
+                    egui::ComboBox::from_id_salt(("classification", data.source_id, artifact_id))
+                        .selected_text(&classification)
                         .show_ui(ui, |ui| {
-                            for role in ROLES.iter().copied().filter(|role| *role != "Unknown") {
-                                if ui.selectable_label(false, role).clicked() {
-                                    for item in &items {
-                                        let key = format!("{source}\0{}", item.path);
-                                        if self.classification_selected.get(&key).copied().unwrap_or(true) {
-                                            self.classification_choices.insert(key, role.to_owned());
-                                        }
-                                    }
-                                }
+                            for role in ArtifactRole::dropdown() {
+                                ui.selectable_value(&mut classification, role.label().to_owned(), role.label());
                             }
                         });
-                    });
-                    ui.small("Applies to checked rows only; edit individual rows afterwards.");
-                    });
+                    if classification != current_classification(item) {
+                        changes.push((artifact_id, classification));
+                    }
                 });
-        });
-        ui.add_space(10.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.add(egui::Button::new("✓ CONFIRM ALL").min_size(egui::vec2(170.0, 38.0))).clicked() {
-                if unknown > 0 {
-                    self.status = format!("Cannot confirm: {unknown} files or folders are still Unknown. Classify the highlighted entries first.");
-                } else {
-                let result: Result<usize> = (|| {
-                    let db = self.db.as_mut().ok_or_else(|| anyhow::anyhow!("No writable index"))?;
-                    let tx = db.transaction()?;
-                    let paths: HashSet<String> = {
-                        let mut q = tx.prepare("SELECT path FROM artifacts")?;
-                        q.query_map([], |r| r.get::<_, String>(0))?
-                            .collect::<rusqlite::Result<HashSet<_>>>()?
-                    };
-                    for item in &items {
-                        let role = &self.classification_choices[&format!("{source}\0{}", item.path)];
-                        tx.execute("INSERT INTO file_classifications(source,path,role,confirmed) VALUES (?1,?2,?3,1)
-                            ON CONFLICT(source,path) DO UPDATE SET role=excluded.role,confirmed=1",
-                            params![&source, &item.path, role])?;
-                        // Only an unambiguous inventory match is promoted to
-                        // the authoritative path-level annotation.
-                        if let Some(path) = engine::classified_artifact_path(&item.path, &source, &paths) {
-                            tx.execute("INSERT INTO artifact_roles(path,role,source,confirmed)
-                                VALUES (?1,?2,?3,1) ON CONFLICT(path) DO UPDATE SET
-                                role=excluded.role,source=excluded.source,confirmed=1",
-                                params![path, role, &source])?;
-                        }
+                // Hidden occurrences may have different match IDs; surface any validation error.
+                for match_item in data.groups.iter().flat_map(|g| &g.matches)
+                    .filter(|m| m.artifact_id == artifact_id) {
+                    if let Some(error) = errors.get(&match_item.id.to_string()) {
+                        ui.colored_label(egui::Color32::RED, error);
                     }
-                    // A confirmed role belongs to the physical artifact, not to
-                    // the notebook that happened to reveal it first. Propagate
-                    // only when both references resolve uniquely to the same
-                    // indexed path; never propagate by basename alone.
-                    let mut confirmed_paths = HashSet::new();
-                    for item in &items {
-                        if let Some(path) = engine::classified_artifact_path(&item.path, &source, &paths) {
-                            confirmed_paths.insert(path);
-                        }
-                    }
-                    let mut resolved = resolve_classified_issues(&tx, &source, &items)?;
-                    if !confirmed_paths.is_empty() {
-                        let mut stmt = tx.prepare("SELECT rowid, notebook, filename FROM issues WHERE decision='open'")?;
-                        let open_issues: Vec<(i64, String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                            .collect::<rusqlite::Result<_>>()?;
-                        drop(stmt);
-                        for (rowid, script, reference) in open_issues {
-                            if let Some(path) = engine::classified_artifact_path(&reference, &script, &paths) {
-                                if confirmed_paths.contains(&path) {
-                                    resolved += tx.execute(
-                                        "UPDATE issues SET decision='classified', note='Scientist-confirmed physical artifact classification' WHERE rowid=?1 AND decision='open'",
-                                        params![rowid],
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    tx.commit()?; Ok(resolved)
-                })();
-                match result {
-                    Ok(resolved) => {
-                        self.wizard_mode = false;
-                        self.active_dependency = None;
-                        ui.ctx().request_repaint();
-                        // Keep the user's current Build / Repair category.
-                        // Discard cached wizard choices so shared confirmed roles
-                        // are loaded afresh when another notebook is opened.
-                        self.classification_choices.clear();
-                        self.recently_confirmed = Some((source.clone(), selected.clone()));
-                        self.refresh();
-                        self.publish();
-                        self.status = format!("Confirmed {} classifications; resolved {resolved} investigation occurrence(s).", items.len());
-                    }
-                    Err(e) => self.status = format!("Cannot save classifications: {e:#}"),
-                }
                 }
             }
-            if ui.add(egui::Button::new("📂 OPEN SCRIPT").min_size(egui::vec2(170.0, 38.0))).clicked() {
-                if let Err(e) = open_indexed_file(&root, &source) { self.status = format!("Cannot open script: {e}"); }
-            }
-            if unknown > 0 { ui.label("Classify all unknown entries to confirm."); }
-        });
-        ui.label(&self.status);
-        ui.small("Figures can be classified. Suggestions are editable; confirming does not create global YAML rules.");
+            ui.separator();
+        }
+    });
+    for (artifact_id, role) in changes {
+        for item in data.groups.iter_mut().flat_map(|g| &mut g.matches) {
+            if item.artifact_id == artifact_id { set_classification(item, &role); }
+        }
+    }
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(state_id, selected);
+        d.insert_temp(role_id, bulk_role);
+    });
+    open_entry
+}
+
+fn current_classification(item: &folder_history::core::history_db::WizardMatch) -> &str {
+    match item.decision_id {
+        2 => "Not relevant",
+        0 => "Unknown",
+        _ => item.role.as_deref().unwrap_or("Unknown"),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn review_shows_real_linked_files_not_symbolic_expressions() {
-        let db = Connection::open_in_memory().unwrap();
-        engine::schema(&db).unwrap();
-        let script = "scripts/notebook.ipynb";
-        for path in ["scripts/adult-spring/data.h5", "scripts/adult-summer/data.h5"] {
-            db.execute("INSERT INTO artifacts(path,kind) VALUES (?1,'matrix')", params![path]).unwrap();
-            db.execute("INSERT INTO relations(source,target,kind,evidence) VALUES (?1,?2,'reads','glob')", params![script,path]).unwrap();
-        }
-        let issues = vec![Issue { id: 1, notebook: script.into(), cell: 1,
-            filename: "analyzed_cellranger_h5_\"+adatas[0].obs['sname'][0]+\".h5ad".into(),
-            category: "unresolved".into(), decision: "open".into(), note: String::new() }];
-        let items = candidates(script, &issues, Some(&db));
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| item.path.ends_with("data.h5")));
-    }
-    #[test]
-    fn bulk_classification_updates_every_row() {
-        let items = vec![
-            Candidate { path: "a.txt".into(), variable: "a".into(), folder: false },
-            Candidate { path: "b.txt".into(), variable: "b".into(), folder: false },
-            Candidate { path: "data/".into(), variable: "d".into(), folder: true },
-        ];
-        let mut choices = HashMap::new();
-        choices.insert("script.ipynb\0a.txt".into(), "Analyzed data".into());
-        set_all_roles(&mut choices, "script.ipynb", &items, "Other Input Files");
-        assert_eq!(choices.len(), 3);
-        assert!(choices.values().all(|role| role == "Other Input Files"));
-    }
-    #[test]
-    fn classification_labels_include_new_and_legacy_values() {
-        for role in ["Sample metadata", "Reference data", "Result files", "Figures & images",
-                     "Input data", "Analyzed data", "Quantification results"] {
-            assert!(ROLES.contains(&role), "missing role: {role}");
-        }
-    }
-    #[test]
-    fn folder_path_matches_prefixed_issue() {
-        assert!(matches_issue_path("Local/OMIX236-20/Isabella_OMIX236", "Isabella_OMIX236"));
-        assert!(matches_issue_path("data/quant_res/", "data/quant_res"));
-        assert!(!matches_issue_path("Isabella_OMIX236_other", "Isabella_OMIX236"));
-    }
-    #[test]
-    fn simple_assignments_and_figures() {
-        assert_eq!(assignment("analyzed = \"sample_analyzed.h5ad\""), Some(("analyzed".into(), "sample_analyzed.h5ad".into())));
-        assert_eq!(assignment("raw = 'sample_raw.h5ad'"), Some(("raw".into(), "sample_raw.h5ad".into())));
-        assert_eq!(assignment("plot = 'figures/plot.png'"),
-            Some(("plot".into(), "figures/plot.png".into())));
-        assert!(assignment("x = 42").is_none());
-        assert!(assignment("sep = '\\t'").is_none());
-        assert!(assignment("sep = '\t'").is_none());
-    }
-}
-
-#[cfg(test)]
-mod resolution_tests {
-    use super::*;
-    #[test]
-    fn confirming_classifications_resolves_only_matching_open_investigations() {
-        let mut db = Connection::open_in_memory().unwrap();
-        let _ = db.execute_batch("CREATE TABLE issues (notebook TEXT, filename TEXT, category TEXT, decision TEXT, note TEXT);
-            INSERT INTO issues VALUES ('a.ipynb','sample.h5ad','unresolved','open','');
-            INSERT INTO issues VALUES ('a.ipynb','sample.h5ad','ambiguous','open','');
-            INSERT INTO issues VALUES ('a.ipynb','sample.h5ad','external','open','');
-            INSERT INTO issues VALUES ('b.ipynb','sample.h5ad','unresolved','open','');
-            INSERT INTO issues VALUES ('a.ipynb','other.h5ad','unresolved','open','');");
-        let tx = db.transaction().unwrap();
-        let items = vec![Candidate { path: "sample.h5ad".into(), variable: "analyzed".into(), folder: false }];
-        assert_eq!(resolve_classified_issues(&tx, "a.ipynb", &items).unwrap(), 3);
-        tx.commit().unwrap();
-        let resolved: i64 = db.query_row("SELECT COUNT(*) FROM issues WHERE decision='classified'", [], |r| r.get(0)).unwrap();
-        let open: i64 = db.query_row("SELECT COUNT(*) FROM issues WHERE decision='open'", [], |r| r.get(0)).unwrap();
-        assert_eq!((resolved,open), (3,2));
+fn set_classification(item: &mut folder_history::core::history_db::WizardMatch, role: &str) {
+    match role {
+        "Unknown" => { item.decision_id = MatchDecision::NeedsWork as i64; item.role = None; }
+        "Not relevant" => { item.decision_id = MatchDecision::Rejected as i64; item.role = None; }
+        _ => { item.decision_id = MatchDecision::Accepted as i64; item.role = Some(role.to_owned()); }
     }
 }
