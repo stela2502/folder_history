@@ -14,6 +14,13 @@ use rusqlite::OpenFlags;
 use anyhow::Context;
 
 
+const DIRECTORY_CHILD_EVIDENCE: &str = ": inferred under output directory ";
+
+/// A file link inherited from a directory output is reviewed through the folder.
+pub fn is_directory_child_link(direction: &str, evidence: &str) -> bool {
+    direction == "writes" && evidence.contains(DIRECTORY_CHILD_EVIDENCE)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMatchRow {
     pub source_id: i64,
@@ -91,8 +98,9 @@ impl DbArchiveView for Connection {
         let mut q = self.prepare("SELECT m.id,s.path,m.location,p.pattern,m.direction \
             FROM file_matches m JOIN artifacts s ON s.id=m.source_id \
             JOIN file_paths p ON p.id=m.filepath_id WHERE m.decision_id=0 \
+            AND (m.direction!='writes' OR instr(m.evidence,?1)=0) \
             ORDER BY s.path,m.location,m.id")?;
-        let issues = q.query_map([], |r| Ok(Issue {
+        let issues = q.query_map([DIRECTORY_CHILD_EVIDENCE], |r| Ok(Issue {
             id:r.get(0)?,notebook:r.get(1)?,cell:r.get(2)?,filename:r.get(3)?,
             category:"unresolved".to_owned(),decision:"open".to_owned(),note:r.get(4)?,
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -241,6 +249,7 @@ impl DbIssues for Connection {
         for row in rows {
             let (id,filepath_id,location,pattern,is_multi,item) = row?;
             let _ = id;
+            if is_directory_child_link(&item.direction, &item.evidence) { continue; }
             if let Some(group) = groups.iter_mut().find(|g| g.filepath_id==filepath_id && g.location==location && g.direction==item.direction) {
                 group.matches.push(item);
             } else {
@@ -297,6 +306,27 @@ mod tests {
         db.set_script_ignored("analysis/a.py", false).unwrap();
         assert!(!db.ignored_review_scripts().unwrap().contains("analysis/a.py"));
     }
+    #[test]
+    fn folder_children_remain_in_provenance_but_are_reviewed_through_the_folder() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        crate::core::engine::schema(&db)?;
+        db.record_match("a.py", 3, "stats", "stats", "writes_directory", "directory writer")?;
+        db.record_match("a.py", 3, "stats/child.csv", "stats/child.csv", "writes",
+            "a.py: cell/line 3: inferred under output directory stats from writer(stats)")?;
+        db.record_match("a.py", 4, "stats/direct.csv", "stats/direct.csv", "writes", "explicit writer")?;
+
+        let review = db.issues(db.source_artifact_id("a.py")?)?;
+        let targets: HashSet<_> = review.writes().flat_map(|g| &g.matches)
+            .map(|m| m.artifact.as_str()).collect();
+        assert_eq!(targets, HashSet::from(["stats", "stats/direct.csv"]));
+
+        let (_, relations, issues) = db.archive_view()?;
+        assert!(relations.iter().any(|r| r.target == "stats/child.csv"));
+        assert_eq!(issues.iter().map(|i| i.filename.as_str()).collect::<HashSet<_>>(),
+            HashSet::from(["stats", "stats/direct.csv"]));
+        Ok(())
+    }
+
     #[test]
     fn issues_include_rejected_and_accepted_matches() {
         let db=Connection::open_in_memory().unwrap();

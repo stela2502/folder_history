@@ -1,4 +1,5 @@
 use crate::*;
+use folder_history::core::history_db::is_directory_child_link;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Tab { Search, Graph, Build, Spectator }
@@ -837,7 +838,10 @@ impl eframe::App for App {
                         }
                         ui.separator();
                         ui.heading("Direct relationships");
-                        let links: Vec<Relation> = self.relations.iter().filter(|r| r.source==path || r.target==path).cloned().collect();
+                        let links: Vec<Relation> = self.relations.iter()
+                            .filter(|r| r.target == path || (r.source == path
+                                && !is_directory_child_link(&r.kind, &r.evidence)))
+                            .cloned().collect();
                         if links.is_empty() { ui.label("No relationships discovered yet."); }
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for r in links {
@@ -1065,6 +1069,7 @@ impl eframe::App for App {
                         }
                     } else {
                         for edge in &self.relations {
+                            if is_directory_child_link(&edge.kind, &edge.evidence) { continue; }
                             let folder = edge.source.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
                             if let Some(refs) = folders.get_mut(folder).and_then(|scripts| scripts.get_mut(&edge.source)) {
                                 if matches!(edge.kind.as_str(), "reads" | "writes" | "writes_directory") &&

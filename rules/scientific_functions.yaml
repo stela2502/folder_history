@@ -1,49 +1,5 @@
 # Source-verified function contracts. Inference is conditional on indexed outputs.
 # An output is not proof that a historical function call actually executed.
-version: 2
-functions:
-  - name: export2cellexalvr
-    language: r
-    directory_arg: 2
-    files: [cellexalObj.RData, a.meta.cell, index.facs, c.meta.gene, database.sqlite]
-    patterns: ['*.mds']
-    source: sonejilab/cellexalvrR R/ExportFunctions.R
-  - name: write_as_sqlite3
-    language: r
-    output_arg: 2
-    source: sonejilab/cellexalvrR R/ExportFunctions.R
-  - name: write_stats_tables
-    language: python
-    directory_arg: 2
-    patterns: ['*.csv']
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-  - name: write_pseudobulk_stats_tables
-    language: python
-    directory_arg: 2
-    patterns: ['*.csv']
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-  - name: write_data_to_directory
-    language: python
-    directory_arg: 2
-    files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-  - name: impute_expression_data
-    language: python
-    directory_arg: 2
-    files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-  - name: write_top_genes_per_cluster
-    language: python
-    output_arg: 4
-    default_output: top_genes_per_cluster.csv
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-  - name: predict_celltype
-    language: python
-    output_arg: 4
-    default_output: cluster_marker_summary.csv
-    files: [cluster_label_proposals.csv]
-    source: stela2502/ScanpyAutoAnalyzer functions.py
-
 # Canonical names are resolved from Python imports (including aliases).
 # Only link figure files that actually exist in the indexed archive.
 # Scanpy/scVelo filename conventions vary by plotting function/version.
@@ -63,6 +19,50 @@ plotting:
 
 # Generic CLI provenance. Arguments are parsed by flag, not filename heuristics.
 operations:
+  - name: export2cellexalvr
+    language: r
+    source: sonejilab/cellexalvrR R/ExportFunctions.R
+    arguments:
+      - position: 2
+        aliases: [path, output_dir, outpath, directory]
+        role: output
+        kind: directory
+        expected_files: [cellexalObj.RData, a.meta.cell, index.facs, c.meta.gene, database.sqlite, '*.mds']
+  - name: write_as_sqlite3
+    language: r
+    source: sonejilab/cellexalvrR R/ExportFunctions.R
+    arguments:
+      - {position: 2, aliases: [output_file, out_csv, ofile, file, filename], role: output, kind: file}
+  - name: write_data_to_directory
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - position: 2
+        aliases: [path, output_dir, outpath, directory]
+        role: output
+        kind: directory
+        expected_files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
+  - name: impute_expression_data
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - position: 2
+        aliases: [path, output_dir, outpath, directory]
+        role: output
+        kind: directory
+        expected_files: [matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz]
+  - name: write_top_genes_per_cluster
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - {position: 4, aliases: [output_file, out_csv, ofile, file, filename], role: output, kind: file, default: top_genes_per_cluster.csv}
+  - name: predict_celltype
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - {position: 4, aliases: [output_file, out_csv, ofile, file, filename], role: output, kind: file, default: cluster_marker_summary.csv}
+      - {role: output, kind: file, default: cluster_label_proposals.csv}
+
   - name: sc-analyse
     subcommand: gex
     language: bash
@@ -80,6 +80,32 @@ operations:
         role: output
         kind: directory
         descendants: true
+
+  # Nextflow run options and common workflow parameter conventions.
+  - name: nextflow
+    subcommand: run
+    language: bash
+    source: Nextflow CLI, nf-core and EPI2ME wf-single-cell
+    arguments:
+      - {name: -c, role: input, kind: file}
+      - {name: -C, role: input, kind: file}
+      - {name: -params-file, role: input, kind: file}
+      - {name: -profile, role: parameter, kind: value}
+      - {name: -resume, role: parameter, kind: value}
+      - {name: -r, role: parameter, kind: value}
+      - {name: -w, role: parameter, kind: directory}
+      - {name: -work-dir, role: parameter, kind: directory}
+      - {name: --fastq, role: input, kind: directory}
+      - {name: --input, role: input, kind: file}
+      - {name: --samples, role: input, kind: file}
+      - {name: --samplesheet, role: input, kind: file}
+      - {name: --sample_sheet, role: input, kind: file}
+      - {name: --single_cell_sample_sheet, role: input, kind: file}
+      - {name: --ref_genome_dir, role: input, kind: directory}
+      - {name: --fasta, role: input, kind: file}
+      - {name: --gtf, role: input, kind: file}
+      - {name: --out_dir, role: output, kind: directory}
+      - {name: --outdir, role: output, kind: directory}
 
   # samtools commands with explicit output arguments. Stdout-only commands
   # are intentionally omitted: shell redirection belongs to the shell parser.
@@ -167,6 +193,27 @@ operations:
     arguments:
       - {name: --outdir, role: parameter, kind: directory}
       - {name: -o, role: parameter, kind: directory}
+
+  # Stats writers own the output directory passed as argument 2.
+  - name: write_stats_tables
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - position: 2
+        aliases: [path, output_dir, outpath, directory]
+        role: output
+        kind: directory
+        file_type: StatisticalResults
+
+  - name: write_pseudobulk_stats_tables
+    language: python
+    source: stela2502/ScanpyAutoAnalyzer functions.py
+    arguments:
+      - position: 2
+        aliases: [path, output_dir, outpath, directory]
+        role: output
+        kind: directory
+        file_type: StatisticalResults
 
   # Scanpy / AnnData I/O (official Scanpy Reading and Writing docs).
   # The callable name is canonicalized using Python import aliases.

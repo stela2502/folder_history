@@ -1,12 +1,13 @@
-use folder_history::core::{batch_scan_folder, documentation};
+use folder_history::core::{batch_scan_folder, documentation, provenance::configure_cli_rule_files};
 
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 fn usage() {
-    eprintln!("Usage: folder-history-cli sub-folders-of <main-folder> [--resume] [--rescan] [--jobs N] [--write-readme]");
+    eprintln!("Usage: folder-history-cli sub-folders-of <main-folder> [--resume] [--rescan] [--jobs N] [--write-readme] [--rules FILE]...");
     eprintln!("       folder-history-cli generate-readme <indexed-research-folder>");
+    eprintln!("--rules FILE loads an additional YAML rule file. Repeat to load more than one.");
     eprintln!("Each immediate subfolder is scanned into its own local FolderHistory index.");
     eprintln!("Default: --jobs 1; skip existing databases. --rescan: refresh while retaining manual decisions.");
 }
@@ -14,6 +15,7 @@ fn usage() {
 fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let command = args.next();
+    if matches!(command.as_deref(), Some("--help" | "-h")) { usage(); return Ok(()); }
     if command.as_deref() == Some("generate-readme") {
         let folder = args.next().ok_or_else(|| anyhow::anyhow!("Missing research folder"))?;
         if args.next().is_some() { anyhow::bail!("Unexpected additional argument"); }
@@ -29,11 +31,17 @@ fn run() -> anyhow::Result<()> {
     let mut rescan = false;
     let mut write_readme = false;
     let mut jobs = 1usize;
+    let mut rule_files = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--resume" => {}, // Skipping indexed folders is the default.
             "--rescan" => rescan = true,
             "--write-readme" => write_readme = true,
+            "--rules" => {
+                let value = args.next().filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--rules requires a YAML file path"))?;
+                rule_files.push(PathBuf::from(value));
+            },
             "--jobs" => {
                 let value = args.next().ok_or_else(|| anyhow::anyhow!("--jobs requires a number"))?;
                 jobs = value.parse::<usize>()
@@ -44,6 +52,7 @@ fn run() -> anyhow::Result<()> {
             other => anyhow::bail!("Unknown argument: {other}"),
         }
     }
+    if !rule_files.is_empty() { configure_cli_rule_files(rule_files)?; }
     let mut folders = std::fs::read_dir(&root)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {

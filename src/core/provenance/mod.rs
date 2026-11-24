@@ -13,6 +13,7 @@ mod cli_rules;
 mod notebook;
 #[cfg(test)] mod tests;
 
+pub use rules::configure_cli_rule_files;
 use rules::*;
 use resolver::*;
 use variable::{Environment, FileMatches, PathPart, Variable};
@@ -42,7 +43,11 @@ pub(crate) fn classification_rules(root: &std::path::Path) -> anyhow::Result<(Ve
                 if let Some(role) = arg.file_type {
                     operations.push((operation.name.clone(), arg.name.clone(), "direct".into(), role, false));
                 }
-                if let Some(role) = arg.descendant_file_type {
+                let descendant_role = arg.descendant_file_type.or_else(|| {
+                    (arg.kind.as_deref() == Some("directory") && arg.expected_files.is_empty())
+                        .then_some(arg.file_type).flatten()
+                });
+                if let Some(role) = descendant_role {
                     operations.push((operation.name.clone(), arg.name.clone(), "descendant".into(), role, true));
                 }
             }
@@ -163,4 +168,55 @@ pub fn diagnose_shell_rules(root: &std::path::Path, script: &std::path::Path, re
         }
     }
     Ok(output)
+}
+
+/// Try one operation against a pasted source fragment and an archive inventory.
+pub fn preview_operation_rule(
+    yaml: &str, source: &str, root: &std::path::Path, relative_script: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    use std::collections::HashSet;
+    use crate::core::engine::{excluded_dir, excluded_file, schema};
+
+    let rules: RuleSet = serde_yaml::from_str(yaml)?;
+    let [operation] = rules.operations.as_slice() else {
+        anyhow::bail!("Preview requires exactly one operation");
+    };
+    let db = rusqlite::Connection::open_in_memory()?;
+    schema(&db)?;
+    let mut paths = HashSet::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|entry| {
+        entry.depth() == 0 || !entry.file_type().is_dir()
+            || !excluded_dir(&entry.file_name().to_string_lossy(), false)
+    }) {
+        let entry = entry?;
+        if entry.depth() == 0 { continue; }
+        let directory = entry.file_type().is_dir();
+        if !directory && (!entry.file_type().is_file()
+            || excluded_file(&entry.file_name().to_string_lossy())) { continue; }
+        let path = entry.path().strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+        if directory {
+            db.execute("INSERT INTO artifacts(path,kind) VALUES (?1,'directory')", [&path])?;
+        }
+        paths.insert(path);
+    }
+    let language = operation.language.as_str();
+    if language == "bash" {
+        let lines: Vec<_> = source.lines().enumerate()
+            .map(|(i, line)| (i + 1, line.to_owned())).collect();
+        analyze_lines(&db, relative_script, &lines, &paths, true, &[], &[], &rules.operations)?;
+    } else {
+        analyze_source(&db, relative_script, source, 1, &paths, &mut Environment::default(),
+            &[], &mut std::collections::HashMap::new(), &[], &rules.operations, language)?;
+    }
+    let marker = format!("{}{} [", operation.name,
+        operation.subcommand.as_ref().map(|s| format!(" {s}")).unwrap_or_default());
+    let direct = format!(" via {marker}");
+    let inherited = format!(" from {marker}");
+    let mut stmt = db.prepare("SELECT DISTINCT m.direction, a.path
+        FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id
+        WHERE instr(m.evidence, ?1)>0 OR instr(m.evidence, ?2)>0
+        ORDER BY m.direction, a.path")?;
+    let matches = stmt.query_map([direct, inherited], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(matches)
 }

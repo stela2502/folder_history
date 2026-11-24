@@ -6,7 +6,6 @@ use crate::core::ArtifactRole;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct RuleSet {
-    pub(super) version: u32,
     #[serde(default)]
     pub(super) functions: Vec<FunctionRule>,
     #[serde(default)]
@@ -66,6 +65,7 @@ pub(super) struct OperationRule {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct OperationArgument {
     #[serde(default)] pub(super) name: String,
+    #[serde(default)] pub(super) aliases: Vec<String>,
     pub(super) role: String,
     #[serde(default)] pub(super) kind: Option<String>,
     #[serde(default)] pub(super) cardinality: Option<String>,
@@ -90,7 +90,7 @@ pub(super) fn load_operation_rules(root: &Path) -> Result<Vec<OperationRule>> {
                 if !arg.expected_files.is_empty() && (arg.role != "output" || arg.kind.as_deref() != Some("directory")) {
                     anyhow::bail!("expected_files requires an output directory in operation {}", rule.name);
                 }
-                if (arg.name.trim().is_empty() && arg.position.is_none())
+                if (arg.name.trim().is_empty() && arg.aliases.is_empty() && arg.position.is_none() && arg.default.is_none())
                     || !matches!(arg.role.as_str(), "input" | "output" | "parameter")
                     || !matches!(arg.kind.as_deref().unwrap_or("file"), "file" | "directory" | "value")
                     || !matches!(arg.cardinality.as_deref().unwrap_or("one"), "one" | "many" | "zero")
@@ -103,6 +103,17 @@ pub(super) fn load_operation_rules(root: &Path) -> Result<Vec<OperationRule>> {
         }
     }
     Ok(combined)
+}
+
+static CLI_RULE_FILES: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Validate and register explicit CLI rules before starting batch workers.
+pub fn configure_cli_rule_files(paths: Vec<std::path::PathBuf>) -> Result<()> {
+    for path in &paths {
+        read_rule_set(path)?;
+    }
+    CLI_RULE_FILES.set(paths)
+        .map_err(|_| anyhow::anyhow!("CLI rule files were already configured"))
 }
 
 // Layered rule libraries: built-in < configured external < archive-local.
@@ -128,6 +139,11 @@ pub(super) fn rule_layers(root: &Path) -> Result<Vec<RuleSet>> {
             layers.push(read_rule_set(&path)?);
         }
     }
+    if let Some(paths) = CLI_RULE_FILES.get() {
+        for path in paths {
+            layers.push(read_rule_set(path)?);
+        }
+    }
     for name in ["provenance_rules.yaml", "extensions.yaml", "file_types.yaml", "operations.yaml"] {
         let path = root.join(".folder_history").join(name);
         if path.is_file() { layers.push(read_rule_set(&path)?); }
@@ -138,9 +154,6 @@ pub(super) fn rule_layers(root: &Path) -> Result<Vec<RuleSet>> {
 pub(super) fn read_rule_set(path: &Path) -> Result<RuleSet> {
     let rules: RuleSet = serde_yaml::from_str(&std::fs::read_to_string(path)?)
         .with_context(|| format!("Parsing provenance rules {}", path.display()))?;
-    if rules.version != 1 && rules.version != 2 {
-        anyhow::bail!("Unsupported provenance rules version in {}", path.display());
-    }
     Ok(rules)
 }
 

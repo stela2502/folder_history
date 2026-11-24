@@ -338,7 +338,7 @@ pub fn researcher_markdown(root: &Path, artifacts: &[Artifact], relations: &[Rel
 }
 /// Example of the help generated for a researcher, without fabricated archive findings.
 pub fn example_local_help_markdown() -> String {
-    format!("<!-- {MARKER} -->\n\n{INTRO}\n\n{HELP}")
+    format!("<!-- {MARKER} -->\n\nSee [External YAML structure](ExternalYamlStructure.md) to teach FolderHistory about your own analysis tools and file types.\n\n{INTRO}\n\n{HELP}")
 }
 pub fn repository_markdown() -> String {
     format!("<!-- {MARKER} -->\n\n# FolderHistory\n\nOffline desktop software for tracing research files to the scripts and notebooks that read or produce them.\n\n{INTRO}\n\n{HELP}\n\n## Developer notes\n\nThe Rust source contains the GUI, provenance scanner and batch CLI. Build and test with `cargo test -r` and `cargo build -r --bins`.\n\nBatch scan: `folder-history-cli sub-folders-of /path/to/NAS --resume --write-readme`.\n\nGenerate documentation for an already indexed archive: `folder-history-cli generate-readme /path/to/Researcher`.\n")

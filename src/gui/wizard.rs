@@ -107,7 +107,7 @@ fn show_wizard_data(
     let role_id = egui::Id::new(("wizard_bulk_role", data.source_id));
     let mut bulk_role: String = ui.ctx().data_mut(|d| d.get_temp(role_id).unwrap_or_else(|| "Unknown".to_owned()));
     let total: usize = data.groups.iter().map(|g| g.matches.len()).sum();
-    ui.label(format!("{} unique files · {total} recorded occurrences", visible.len()));
+    ui.label(format!("{} unique files/folders · {total} recorded occurrences", visible.len()));
     ui.separator();
 
     ui.group(|ui| {
@@ -205,7 +205,6 @@ fn show_wizard_data(
 fn current_classification(item: &folder_history::core::history_db::WizardMatch) -> &str {
     match item.decision_id {
         2 => "Not relevant",
-        0 => "Unknown",
         _ => item.role.as_deref().unwrap_or("Unknown"),
     }
 }

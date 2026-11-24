@@ -86,7 +86,7 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(dir.join(".folder_history")).unwrap();
         let config = dir.join(".folder_history/file_types.yaml");
-        std::fs::write(&config, "version: 2\nfile_types:\n  - {pattern: '*.h5ad', file_type: RawData}\n").unwrap();
+        std::fs::write(&config, "file_types:\n  - {pattern: '*.h5ad', file_type: RawData}\n").unwrap();
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE artifact_roles(path TEXT PRIMARY KEY,role TEXT NOT NULL,source TEXT NOT NULL,confirmed INTEGER NOT NULL);
             CREATE TABLE artifacts(id INTEGER PRIMARY KEY,path TEXT,kind TEXT);
@@ -95,7 +95,7 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
         refresh(&db, &dir, &paths).unwrap();
         assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Raw experimental data");
         db.execute("UPDATE artifact_roles SET role='Reference data',confirmed=1 WHERE path='a.h5ad'", []).unwrap();
-        std::fs::write(&config, "version: 2\nfile_types:\n  - {pattern: '*.h5ad', file_type: StatisticalResults}\n").unwrap();
+        std::fs::write(&config, "file_types:\n  - {pattern: '*.h5ad', file_type: StatisticalResults}\n").unwrap();
         refresh(&db, &dir, &paths).unwrap();
         assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Reference data");
         assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='b.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Statistical results");

@@ -166,6 +166,13 @@ pub(super) fn logic_links(
 }
 
 pub(super) fn record_logic_links(db: &Connection, rel: &str, line: usize, results: &[LogicLinks], paths: &HashSet<String>) -> Result<usize> {
+    record_directory_output_links(db, rel, line, results, paths, None)
+}
+
+pub(super) fn record_directory_output_links(
+    db: &Connection, rel: &str, line: usize, results: &[LogicLinks],
+    paths: &HashSet<String>, output_inventory: Option<&HashSet<String>>,
+) -> Result<usize> {
     let mut count = 0;
     for result in results {
         for variable in &result.links.files {
@@ -207,6 +214,7 @@ pub(super) fn record_logic_links(db: &Connection, rel: &str, line: usize, result
                 Variable::Unknown => continue,
             };
             if candidates.len() > 30 { continue; }
+            let unambiguous = candidates.len() == 1;
             for target in candidates {
                 // Empty directories have no descendants; the scanner indexes
                 // them explicitly as directory artifacts before parsing scripts.
@@ -220,6 +228,30 @@ pub(super) fn record_logic_links(db: &Connection, rel: &str, line: usize, result
                 let evidence = format!("{rel}: cell/line {line}: {} via {}({})", if matches!(variable, Variable::Parts(_)) { "inferred" } else { "explicit" }, result.function, result.expression);
                 super::super::history_db::DbProvenance::record_match(db, rel, line, &expression, &target, kind, &evidence)?;
                 count += 1;
+                if let Some(inventory) = output_inventory.filter(|_| kind == "writes_directory" && unambiguous) {
+                    let prefix = format!("{target}/");
+                    let descendants: Vec<_> = inventory.iter()
+                        .filter(|path| path.starts_with(&prefix)).collect();
+                    let subdirectories: HashSet<_> = descendants.iter()
+                        .filter_map(|path| path.rsplit_once('/').map(|(parent, _)| parent))
+                        .collect();
+                    let mut is_directory = db.prepare_cached("SELECT kind='directory' FROM artifacts WHERE path=?1")?;
+                    for child in descendants {
+                        if subdirectories.contains(child.as_str())
+                            || is_directory.query_row([child], |row| row.get::<_, bool>(0)).unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let child_evidence = format!(
+                            "{rel}: cell/line {line}: inferred under output directory {target} from {}({})",
+                            result.function, result.expression,
+                        );
+                        super::super::history_db::DbProvenance::record_match(
+                            db, rel, line, child, child, "writes", &child_evidence,
+                        )?;
+                        count += 1;
+                    }
+                }
             }
         }
     }

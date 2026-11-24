@@ -36,9 +36,6 @@ fn run() -> Result<()> {
     let contents = std::fs::read_to_string(&yaml)?;
     let doc: serde_yaml::Value = serde_yaml::from_str(&contents)
         .with_context(|| format!("Invalid YAML: {}", yaml.display()))?;
-    if !matches!(doc.get("version").and_then(serde_yaml::Value::as_u64), Some(1 | 2)) {
-        bail!("YAML must declare version: 1 or version: 2");
-    }
     if doc.get("operations").is_none() && doc.get("functions").is_none() {
         bail!("YAML has no operations or functions");
     }

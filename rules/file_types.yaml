@@ -1,6 +1,5 @@
 # Built-in classifications. Override in ~/.folder_history/file_types.yaml
 # or <dataset>/.folder_history/file_types.yaml. All roles use ArtifactRole.
-version: 2
 file_types:
   - {pattern: "*.fastq.gz", file_type: RawData}
   - {pattern: "*.fq.gz", file_type: RawData}

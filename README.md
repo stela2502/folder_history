@@ -4,6 +4,8 @@
 
 Offline desktop software for tracing research files to the scripts and notebooks that read or produce them.
 
+See [External YAML structure](ExternalYamlStructure.md) to teach FolderHistory about your own analysis tools and file types.
+
 # Your Research Data and Analysis History
 
 This directory contains research data, analysis scripts, Jupyter notebooks, figures and results from your research projects.

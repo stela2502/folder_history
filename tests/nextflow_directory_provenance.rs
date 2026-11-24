@@ -16,13 +16,15 @@ INDEX_10X="/scale/gr01/shared/common/genome/10Xindexes/cellranger/6.0/refdata-ge
 RESUME="-resume"
 PATH_FASTQ="./TP53-capt_2/"
 OUTDIR="./TP53-capt_2_outdir_targeted/"
-nextflow run $NEXTFLOW_PACKAGE --fastq $PATH_FASTQ $RESUME \
+SAMPLES="./samples_2.tsv"
+nextflow run $NEXTFLOW_PACKAGE --fastq $PATH_FASTQ --samples "$SAMPLES" $RESUME \
         -profile singularity -c $NF_CONFIG \
         --kit '3prime:v3' --expected_cells 10000 \
         --call_variants --out_dir $OUTDIR --threads 20 --ref_genome_dir $INDEX_10X
 PATH_FASTQ="./TP53-capt_4/"
 OUTDIR="./TP53-capt_4_outdir_targeted/"
-nextflow run $NEXTFLOW_PACKAGE --fastq $PATH_FASTQ $RESUME \
+SAMPLES="./samples_4.tsv"
+nextflow run $NEXTFLOW_PACKAGE --fastq $PATH_FASTQ --samples "$SAMPLES" $RESUME \
         -profile singularity -c $NF_CONFIG \
         --kit '3prime:v3' --expected_cells 10000 \
         --call_variants --out_dir $OUTDIR --threads 20 --ref_genome_dir $INDEX_10X
@@ -45,12 +47,23 @@ fn nextflow_two_invocations_connect_correct_input_and_output_directories() -> an
     let result = (|| -> anyhow::Result<()> {
         fs::write(tmp.join("nextflow_10X_ONT.sh"), SCRIPT)?;
         for capture in [2, 4] {
+            fs::write(tmp.join(format!("samples_{capture}.tsv")), format!("sample\ncap{capture}\n"))?;
             make_file(&tmp, &format!("TP53-capt_{capture}/reads.fastq.gz"))?;
-            make_file(&tmp, &format!("TP53-capt_{capture}_outdir_targeted/results/counts.tsv"))?;
+            let output = format!("TP53-capt_{capture}_outdir_targeted");
+            fs::create_dir_all(tmp.join(&output))?;
+            if capture == 2 {
+                make_file(&tmp, &format!("{output}/results/counts.tsv"))?;
+            }
         }
         let mut db = Connection::open_in_memory()?;
         schema(&db)?;
         scan(&mut db, &tmp, false, &AtomicBool::new(false), |_| {})?;
+        let empty_output_kind: String = db.query_row(
+            "SELECT kind FROM artifacts WHERE path='TP53-capt_4_outdir_targeted'",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(empty_output_kind, "directory");
+
         let source_id: i64 = db.query_row(
             "SELECT id FROM artifacts WHERE path='nextflow_10X_ONT.sh'", [], |r| r.get(0)
         )?;
@@ -58,15 +71,18 @@ fn nextflow_two_invocations_connect_correct_input_and_output_directories() -> an
         let matches: Vec<_> = wizard.groups.iter().flat_map(|g| g.matches.iter()
             .map(move |m| (g.direction.as_str(), m.artifact.as_str()))).collect();
         for capture in [2, 4] {
-            let input = format!("TP53-capt_{capture}/");
-            let output = format!("TP53-capt_{capture}_outdir_targeted/");
-            assert!(matches.iter().any(|(dir, path)| *dir == "reads" &&
-                (path.trim_end_matches('/') == input.trim_end_matches('/') || path.starts_with(&input))),
+            let input = format!("TP53-capt_{capture}");
+            let output = format!("TP53-capt_{capture}_outdir_targeted");
+            let samples = format!("samples_{capture}.tsv");
+            assert!(matches.contains(&("reads", input.as_str())),
                 "missing input directory {input}; detected: {matches:?}");
-            assert!(matches.iter().any(|(dir, path)| (*dir == "writes" || *dir == "writes_directory") &&
-                (path.trim_end_matches('/') == output.trim_end_matches('/') || path.starts_with(&output))),
+            assert!(matches.contains(&("writes_directory", output.as_str())),
                 "missing output directory {output}; detected: {matches:?}");
+            assert!(matches.contains(&("reads", samples.as_str())),
+                "missing sample sheet {samples}; detected: {matches:?}");
         }
+        assert!(matches.iter().all(|(direction, _)| *direction != "writes"),
+            "directory descendants should be hidden in the wizard: {matches:?}");
         Ok(())
     })();
     let _ = fs::remove_dir_all(&tmp);

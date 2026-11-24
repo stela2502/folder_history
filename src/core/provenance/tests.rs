@@ -177,17 +177,17 @@ use super::cli_rules::positional_bounds;
      assert_eq!(canonical("ves", &imports), "scvelo.pl.velocity_embedding_stream");
  }
  #[test]
- fn archive_extensions_override_builtin_function_rule() -> Result<()> {
+ fn archive_extensions_override_builtin_operation_rule() -> Result<()> {
      let temp = std::env::temp_dir().join(format!("folder-history-rule-test-{}", std::process::id()));
      let folder = temp.join(".folder_history");
      std::fs::create_dir_all(&folder)?;
-     std::fs::write(folder.join("extensions.yaml"), "version: 1\nfunctions:\n  - name: export2cellexalvr\n    language: r\n    directory_arg: 2\n    patterns: ['*.tsv']\n    source: test override\n")?;
-     let result = load_rules(&temp);
+     std::fs::write(folder.join("extensions.yaml"), "operations:\n  - name: export2cellexalvr\n    language: r\n    arguments:\n      - {position: 2, role: output, kind: directory, expected_files: ['*.tsv']}\n")?;
+     let result = super::rules::load_operation_rules(&temp);
      let _ = std::fs::remove_dir_all(&temp);
      let rules = result?;
      let matching: Vec<_> = rules.iter().filter(|r| r.name == "export2cellexalvr").collect();
      assert_eq!(matching.len(), 1);
-     assert_eq!(matching[0].patterns, vec!["*.tsv"]);
+     assert_eq!(matching[0].arguments[0].expected_files, vec!["*.tsv"]);
      Ok(())
  }
 
@@ -367,15 +367,16 @@ mod bioinformatics_nasty_provenance_tests {
     fn scientific_function_rules_link_implicit_outputs() -> Result<()> {
         let db = Connection::open_in_memory()?;
         schema(&db)?;
-        let rules = load_rules(Path::new("/nonexistent-folderhistory-rule-test"))?;
+        let root = Path::new("/nonexistent-folderhistory-rule-test");
+        let operation_rules = super::super::rules::load_operation_rules(root)?;
         let paths: HashSet<String> = [
             "analysis/export.R", "analysis/vr", "analysis/vr/cellexalObj.RData",
             "analysis/vr/database.sqlite", "analysis/vr/umap.mds",
             "analysis/stats", "analysis/stats/leiden_cluster_0.csv",
         ].into_iter().map(str::to_owned).collect();
         let mut env = Environment::default();
-        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut env, &rules, &mut HashMap::new(), &[], &[], "r")?;
-        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut env, &rules, &mut HashMap::new(), &[], &[], "python")?;
+        analyze_source(&db, "analysis/export.R", "export2cellexalvr(obj, path='vr')", 1, &paths, &mut env, &[], &mut HashMap::new(), &[], &operation_rules, "r")?;
+        analyze_source(&db, "analysis/export.py", "write_stats_tables(adata, 'stats')", 2, &paths, &mut env, &[], &mut HashMap::new(), &[], &operation_rules, "python")?;
         let targets = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
@@ -479,7 +480,7 @@ mod logic_module_regressions {
     }
 
     #[test]
-    fn yaml_rules_return_variables_before_inventory_matching() {
+    fn legacy_yaml_rules_return_variables_before_inventory_matching() {
         let rule = FunctionRule {
             name: "write_stats_tables".into(), language: "python".into(),
             directory_arg: Some(2), output_arg: None, default_output: None,
@@ -652,8 +653,7 @@ mod funky_match_tests {
 
 #[test]
 fn unified_yaml_cli_rule_parses() {
-    let yaml = r#"version: 2
-operations:
+    let yaml = r#"operations:
   - name: sc-analyse
     language: bash
     subcommand: gex
@@ -675,15 +675,14 @@ fn shell_cli_rule_links_multiple_inputs_and_output_directory() -> Result<()> {
         "GSE156442/sc_analysis_combined/analysis.h5ad",
         "GSE156442/sc_analysis_combined/figures/umap.png",
     ].iter().map(|s| s.to_string()).collect();
-    let yaml = r#"version: 2
-operations:
+    let yaml = r#"operations:
   - name: sc-analyse
     language: bash
     subcommand: gex
     arguments:
       - {name: --data, role: input, kind: file, cardinality: many}
       - {name: --sample-names, role: parameter, kind: value, cardinality: many}
-      - {name: --out, role: output, kind: directory, descendants: true}
+      - {name: --out, role: output, kind: directory}
 "#;
     let rules: RuleSet = serde_yaml::from_str(yaml)?;
     let shell = "sc-analyse gex --data a.h5ad b.h5ad --sample-names A B --out sc_analysis_combined";
@@ -693,6 +692,13 @@ operations:
     let dirs: i64 = db.query_row("SELECT count(*) FROM file_matches WHERE direction='writes_directory'", [], |r| r.get(0))?;
     assert_eq!(reads, 2);
     assert_eq!(dirs, 1);
+    let mut stmt = db.prepare("SELECT a.path FROM file_matches m JOIN artifacts a ON a.id=m.artifact_id WHERE m.direction='writes' ORDER BY a.path")?;
+    let files: Vec<String> = stmt.query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(files, vec![
+        "GSE156442/sc_analysis_combined/analysis.h5ad",
+        "GSE156442/sc_analysis_combined/figures/umap.png",
+    ]);
     Ok(())
 }
 
@@ -752,8 +758,7 @@ fn expected_files_restrict_directory_outputs_and_support_mid_filename_wildcards(
         "project/stats/notes.txt",
         "project/stats/nested/sampleA_nested.csv",
     ].into_iter().map(str::to_owned).collect();
-    let rules: RuleSet = serde_yaml::from_str(r#"version: 2
-operations:
+    let rules: RuleSet = serde_yaml::from_str(r#"operations:
   - name: write_stats_tables
     language: python
     arguments:
@@ -776,8 +781,7 @@ fn operation_default_output_applies_only_when_argument_is_missing() -> Result<()
     schema(&db)?;
     let paths: HashSet<String> = ["project/top_genes.csv", "project/custom.csv"]
         .into_iter().map(str::to_owned).collect();
-    let rules: RuleSet = serde_yaml::from_str(r#"version: 2
-operations:
+    let rules: RuleSet = serde_yaml::from_str(r#"operations:
   - name: write_top_genes
     language: python
     arguments:
@@ -825,4 +829,43 @@ fn expanded_shell_directory_paths_match_empty_inventory_directories() {
         ("20260220/TP53-capt_2".into(), "reads".into()),
         ("20260220/TP53-capt_2_outdir".into(), "writes_directory".into()),
     ]);
+}
+
+#[test]
+fn pseudobulk_output_is_one_folder_in_wizard() -> Result<()> {
+    use crate::core::history_db::{DbArchiveView, DbIssues};
+
+    let db = Connection::open_in_memory()?;
+    schema(&db)?;
+    let script = "analysis/run.py";
+    let folder = "analysis/pseudobulk_leiden_stats";
+    let tables = [
+        "analysis/pseudobulk_leiden_stats/leiden_cluster_6.csv",
+        "analysis/pseudobulk_leiden_stats/nested/leiden_cluster_10.csv",
+    ];
+    let paths: HashSet<String> = tables.into_iter().map(str::to_owned).collect();
+    let rules: RuleSet = serde_yaml::from_str(include_str!("../../../rules/scientific_functions.yaml"))?;
+
+    analyze_source(
+        &db, script,
+        "functions.write_pseudobulk_stats_tables( adata,'pseudobulk_leiden_stats', 'leiden')",
+        1, &paths, &mut Environment::default(), &rules.functions,
+        &mut HashMap::new(), &rules.plotting, &rules.operations, "python",
+    )?;
+
+    let wizard = db.issues(db.source_artifact_id(script)?)?;
+    let outputs: Vec<_> = wizard.writes().flat_map(|group| &group.matches)
+        .map(|item| (item.artifact.as_str(), item.direction.as_str()))
+        .collect();
+    assert_eq!(outputs, vec![(folder, "writes_directory")]);
+
+    let (_, relations, _) = db.archive_view()?;
+    for table in tables {
+        assert!(
+            relations.iter().any(|edge| edge.source == script
+                && edge.target == table && edge.kind == "writes"),
+            "missing individual provenance for {table}"
+        );
+    }
+    Ok(())
 }

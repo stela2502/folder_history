@@ -208,7 +208,7 @@ pub fn excluded_dir(name: &str, _hidden: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     // Never descend into dot-directories or generated workflow/build caches.
     // This applies at every depth, not only at the archive root.
-    name.starts_with('.') || ["work", "__pycache__", "target", "venv", "node_modules", "lost+found"].contains(&lower.as_str())
+    name.starts_with('.') || ["work", "__pycache__", "target", "venv", "node_modules", "lost+found", "rfclusttmp"].contains(&lower.as_str())
 }
 pub fn excluded_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -225,38 +225,31 @@ pub use super::history_db::{assess_timestamps};
 pub fn scan(db: &mut Connection, root: &Path, hidden: bool, cancel: &AtomicBool,
         mut progress: impl FnMut(String)) -> Result<ScanResult> {
     let mut files = Vec::new();
+    let mut paths = HashSet::new();
     let mut warnings = 0usize;
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+    let archive_entries = || WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
         e.depth() == 0 || !e.file_type().is_dir() || !excluded_dir(&e.file_name().to_string_lossy(), hidden)
-    }) {
+    });
+    for entry in archive_entries() {
         if cancel.load(Ordering::Relaxed) { anyhow::bail!("Scan cancelled"); }
         let entry = match entry { Ok(e) => e, Err(e) => { warnings+=1; if warnings <= 10 { progress(format!("Cannot access directory entry: {}", e)); } continue; } };
+        if entry.depth() > 0 && entry.file_type().is_dir() {
+            paths.insert(normalized(entry.path().strip_prefix(root)?));
+            continue;
+        }
         if !entry.file_type().is_file() || entry.path_is_symlink() || excluded_file(&entry.file_name().to_string_lossy()) { continue; }
         let path = entry.path();
         let rel = normalized(path.strip_prefix(root)?);
         let metadata = match entry.metadata() { Ok(m) => m, Err(_) => { warnings+=1; continue; } };
         let ctime = metadata.created().ok().and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok()).map(|v| v.as_secs() as i64);
         let mtime = metadata.modified().ok().and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok()).map(|v| v.as_secs() as i64);
+        paths.insert(rel.clone());
         files.push((rel, kind(path).to_owned(), metadata.len() as i64, mtime, ctime));
         if files.len() % 500 == 0 { progress(format!("Inventory: {} files ({} inaccessible)",files.len(),warnings)); }
     }
     progress(format!("Inventory complete: {} files; extracting provenance...",files.len()));
-    // Candidate references can identify either files or directories. Keep the
-    // artifact inventory file-only, but match script arguments against both.
-    let mut paths: HashSet<String> = files.iter().map(|f| f.0.clone()).collect();
-    for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
-        e.depth() == 0 || !e.file_type().is_dir()
-            || !excluded_dir(&e.file_name().to_string_lossy(), hidden)
-    }) {
-        let entry = match entry { Ok(e) => e, Err(_) => continue };
-        if entry.depth() > 0 && entry.file_type().is_dir() && !entry.path_is_symlink() {
-            if let Ok(rel) = entry.path().strip_prefix(root) {
-                paths.insert(normalized(rel));
-            }
-        }
-    }
     let mut symlinks = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(Result::ok) {
+    for entry in archive_entries().filter_map(Result::ok) {
         if !entry.path_is_symlink() { continue; }
         let Ok(relative) = entry.path().strip_prefix(root) else { continue; };
         let Ok(target) = std::fs::read_link(entry.path()) else { continue; };

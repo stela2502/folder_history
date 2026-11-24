@@ -168,7 +168,8 @@ fn record_operation_values(db: &Connection, rel: &str, line: usize, rule: &Opera
                 end = path[..index].rfind('/');
             }
         }
-        record_logic_links(db, rel, line, &links, &inventory)
+        let output_inventory = (spec.role == "output").then_some(paths);
+        record_directory_output_links(db, rel, line, &links, &inventory, output_inventory)
     } else {
         record_logic_links(db, rel, line, &links, paths)
     }
@@ -189,7 +190,9 @@ pub(super) fn apply_function_operation(db: &Connection, rel: &str, line: usize, 
     }
     let mut count = 0;
     for spec in &rule.arguments {
-        let values = if let Some(expr) = named.get(&spec.name) {
+        let values = if let Some(expr) = named.get(&spec.name)
+            .or_else(|| spec.aliases.iter().find_map(|alias| named.get(alias)))
+        {
             vec![expr.clone()]
         } else if let Some((start,end)) = positional_bounds(spec, positional.len()) {
             positional[start..end].to_vec()
