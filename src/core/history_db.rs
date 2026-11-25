@@ -93,12 +93,23 @@ impl DbArchiveView for Connection {
             id:r.get(0)?,source:r.get(1)?,target:r.get(2)?,kind:r.get(3)?,
             evidence:r.get(4)?,manual:r.get::<_,String>(4)?.starts_with("manual: "),
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        // Unreviewed candidates are actionable wizard work. Do not manufacture
-        // legacy issues for already accepted or explicitly rejected matches.
-        let mut q = self.prepare("SELECT m.id,s.path,m.location,p.pattern,m.direction \
-            FROM file_matches m JOIN artifacts s ON s.id=m.source_id \
-            JOIN file_paths p ON p.id=m.filepath_id WHERE m.decision_id=0 \
-            AND (m.direction!='writes' OR instr(m.evidence,?1)=0) \
+        // Review is needed for missing classifications or competing targets
+        // for a single-file expression. A known role needs no confirmation.
+        let mut q = self.prepare("SELECT m.id,s.path,m.location,p.pattern,m.direction
+            FROM file_matches m JOIN artifacts s ON s.id=m.source_id
+            JOIN artifacts a ON a.id=m.artifact_id
+            JOIN file_paths p ON p.id=m.filepath_id
+            LEFT JOIN artifact_roles ar ON ar.path=a.path
+            WHERE m.decision_id=0
+            AND (m.direction!='writes' OR instr(m.evidence,?1)=0)
+            AND (ar.role IS NULL OR ar.role IN ('Unknown','Not connected')
+                OR (p.is_multi=0 AND EXISTS (
+                    SELECT 1 FROM file_matches other
+                    WHERE other.source_id=m.source_id AND other.filepath_id=m.filepath_id
+                    AND other.location=m.location AND other.direction=m.direction
+                    AND other.artifact_id!=m.artifact_id AND other.decision_id!=2
+                    AND (other.direction!='writes' OR instr(other.evidence,?1)=0)
+                )))
             ORDER BY s.path,m.location,m.id")?;
         let issues = q.query_map([DIRECTORY_CHILD_EVIDENCE], |r| Ok(Issue {
             id:r.get(0)?,notebook:r.get(1)?,cell:r.get(2)?,filename:r.get(3)?,
@@ -324,6 +335,20 @@ mod tests {
         assert!(relations.iter().any(|r| r.target == "stats/child.csv"));
         assert_eq!(issues.iter().map(|i| i.filename.as_str()).collect::<HashSet<_>>(),
             HashSet::from(["stats", "stats/direct.csv"]));
+
+        db.execute("INSERT INTO artifact_roles(path,role,source,confirmed)
+            VALUES ('stats','Statistical results','test',0),
+                   ('stats/direct.csv','OtherDataFile','test',0)", [])?;
+        let (_, relations, issues) = db.archive_view()?;
+        assert_eq!(relations.len(), 3);
+        assert!(issues.is_empty());
+
+        db.record_match("a.py", 4, "stats/direct.csv", "alternate/direct.csv", "writes", "competing target")?;
+        db.execute("INSERT INTO artifact_roles(path,role,source,confirmed)
+            VALUES ('alternate/direct.csv','OtherDataFile','test',0)", [])?;
+        db.execute("UPDATE file_paths SET is_multi=0 WHERE pattern='stats/direct.csv'", [])?;
+        let (_, _, issues) = db.archive_view()?;
+        assert_eq!(issues.len(), 2);
         Ok(())
     }
 

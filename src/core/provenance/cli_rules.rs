@@ -176,7 +176,7 @@ fn record_operation_values(db: &Connection, rel: &str, line: usize, rule: &Opera
 }
 
 pub(super) fn apply_function_operation(db: &Connection, rel: &str, line: usize, args: &str,
-    rule: &OperationRule, env: &Environment, paths: &HashSet<String>) -> Result<usize> {
+    rule: &OperationRule, env: &Environment, paths: &HashSet<String>) -> Result<(usize, bool)> {
     let mut named = HashMap::<String,String>::new();
     let mut positional = Vec::<String>::new();
     for arg in split_args(args) {
@@ -189,6 +189,7 @@ pub(super) fn apply_function_operation(db: &Connection, rel: &str, line: usize, 
         positional.push(arg);
     }
     let mut count = 0;
+    let mut matched_typed_output = false;
     for spec in &rule.arguments {
         let values = if let Some(expr) = named.get(&spec.name)
             .or_else(|| spec.aliases.iter().find_map(|alias| named.get(alias)))
@@ -201,9 +202,11 @@ pub(super) fn apply_function_operation(db: &Connection, rel: &str, line: usize, 
         let values = if values.is_empty() {
             spec.default.as_ref().map(|value| vec![format!("{value:?}")]).unwrap_or_default()
         } else { values };
-        count += record_operation_values(db,rel,line,rule,spec,values,env,paths,None)?;
+        let matches = record_operation_values(db, rel, line, rule, spec, values, env, paths, None)?;
+        count += matches;
+        matched_typed_output |= matches > 0 && spec.role == "output" && spec.file_type.is_some();
     }
-    Ok(count)
+    Ok((count, matched_typed_output))
 }
 
 // Shell syntax extraction, independent of application YAML. Operators are

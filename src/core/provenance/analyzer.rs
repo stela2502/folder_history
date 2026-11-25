@@ -35,12 +35,20 @@ pub(super) fn analyze_source(db:&Connection,rel:&str,source:&str,line_base:usize
         let limit=if !balanced {next.map_or(end,|n|end.min(n))}else{end};
         let args=&remaining[..limit.min(remaining.len())];
         if balanced {
+            let mut matched_typed_output = false;
             if language != "r" {
                 count += plot_outputs(db, rel, line_base+line-1, &canonical(label, imports), args, env, paths, plots)?;
             }
             let name=if language == "r" { label.as_str() } else { label.rsplit('.').next().unwrap_or(label) };
             for rule in operation_rules.iter().filter(|r|r.language==language && operation_name_matches(&r.name, label, imports, language)) {
-                count += apply_function_operation(db, rel, line_base+line-1, args, rule, env, paths)?;
+                let (matches, typed_output) =
+                    apply_function_operation(db, rel, line_base+line-1, args, rule, env, paths)?;
+                count += matches;
+                matched_typed_output |= typed_output;
+            }
+            // Keep the operation evidence used to apply the declared file type.
+            if matched_typed_output {
+                continue;
             }
             for rule in rules.iter().filter(|r|r.name==name && r.language==language) {
                 count+=apply_rule(db,rel,line_base+line-1,args,rule,env,paths)?;

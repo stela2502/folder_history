@@ -3,14 +3,11 @@ use super::*;
 use super::gui::file::{self, FileAction};
 
 fn apply_file_action(app: &mut App, ui: &mut egui::Ui, path: &str, id: Option<i64>, action: FileAction) {
-    match action {
-        FileAction::Select => { if let Some(id) = id { app.selected = Some(id); } },
-        FileAction::CopyPath => { if let Some(root) = &app.root { ui.ctx().copy_text(root.join(path).display().to_string()); } },
-        FileAction::Open | FileAction::OpenParent => {
-            if let Some(root) = &app.root {
-                let result = if action == FileAction::Open { open_indexed_entry(root, path) } else { reveal_in_file_manager(root, path) };
-                if let Err(e) = result { app.status = format!("Cannot open {}: {e}", path); }
-            }
+    if action == FileAction::Select {
+        if let Some(id) = id { app.selected = Some(id); }
+    } else if let Some(root) = &app.root {
+        if let Err(e) = file::perform(ui, root, path, action) {
+            app.status = format!("Cannot access {path}: {e}");
         }
     }
 }
@@ -92,6 +89,19 @@ fn is_analysis_script(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     [".py", ".r", ".rmd", ".ipynb", ".sh", ".nf", ".rscript"]
         .iter().any(|suffix| p.ends_with(suffix))
+}
+
+// Use recorded writes to identify generated scripts within this analysis.
+fn split_generated_scripts<'a>(scripts: &[&'a str], relations: &[Relation])
+    -> (Vec<&'a str>, Vec<&'a str>)
+{
+    let script_paths: std::collections::HashSet<_> = scripts.iter().copied().collect();
+    let generated: std::collections::HashSet<_> = relations.iter()
+        .filter(|edge| edge.kind == "writes" && edge.source != edge.target
+            && script_paths.contains(edge.source.as_str()))
+        .map(|edge| edge.target.as_str())
+        .collect();
+    scripts.iter().copied().partition(|script| !generated.contains(script))
 }
 
 fn show_spectator_file(
@@ -220,7 +230,8 @@ impl App {
                         } else { ui.weak("0 FASTQ"); }
                     }).body(|ui| {
                         ui.label(format!("Scripts / notebooks · {}", scripts.len()));
-                        for script in scripts {
+                        let (primary_scripts, generated_scripts) = split_generated_scripts(&scripts, relations);
+                        let mut show_script = |ui: &mut egui::Ui, script: &str| {
                             let basename = script.rsplit('/').next().unwrap_or(script);
                             let mut raw = Vec::new();
                             let mut input = Vec::new();
@@ -240,15 +251,17 @@ impl App {
                             let id = ui.make_persistent_id(("spectator-script-v2", script));
                             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
                                 .show_header(ui, |ui| {
-                                    if ui.label(basename).on_hover_text(format!("{script}\nDouble-click to open"))
-                                        .double_clicked() {
-                                        pending.push((script.to_owned(), by_path.get(script).map(|a| a.id), FileAction::Open));
+                                    let script_id = by_path.get(script).map(|a| a.id);
+                                    if let Some(action) = file::show(
+                                        ui, basename, script, script_id.is_some() && self.selected == script_id, None,
+                                    ) {
+                                        pending.push((script.to_owned(), script_id, action));
                                     }
                                     relationship_badge(ui, RelationshipShape::Raw, raw.len(), "raw");
                                     relationship_badge(ui, RelationshipShape::Input, input.len(), "input");
                                     relationship_badge(ui, RelationshipShape::Output, output.len(), "output");
                                     if ui.small_button("Open").clicked() {
-                                        pending.push((script.to_owned(), by_path.get(script).map(|a| a.id), FileAction::Open));
+                                        pending.push((script.to_owned(), script_id, FileAction::Open));
                                     }
                                 }).body(|ui| {
                                     for (label, items) in [("Raw input", &raw), ("Other input", &input), ("Output", &output)] {
@@ -263,6 +276,16 @@ impl App {
                                         ui.weak("No recorded file relationships — inspect or resolve provenance.");
                                     }
                                 });
+                        };
+                        for script in primary_scripts {
+                            show_script(ui, script);
+                        }
+                        if !generated_scripts.is_empty() {
+                            ui.collapsing(format!("Generated scripts · {}", generated_scripts.len()), |ui| {
+                                for script in generated_scripts {
+                                    show_script(ui, script);
+                                }
+                            });
                         }
                         if !unassigned.is_empty() {
                             ui.collapsing(format!("Unassigned files · {}", unassigned.len()), |ui| {
@@ -324,6 +347,18 @@ impl App {
 mod folder_review_tests {
     use super::*;
     use rusqlite::Connection;
+    #[test]
+    fn generated_scripts_require_a_recorded_write() {
+        let scripts = ["workflow.R", "runRFclust_1.R", "runRFclust_1.sh", "helper.R"];
+        let edge = |target: &str, kind: &str| Relation {
+            id: 1, source: "workflow.R".into(), target: target.into(),
+            kind: kind.into(), evidence: String::new(), manual: false,
+        };
+        let relations = [edge("runRFclust_1.R", "writes"), edge("helper.R", "reads")];
+        let (primary, generated) = split_generated_scripts(&scripts, &relations);
+        assert_eq!(primary, ["workflow.R", "runRFclust_1.sh", "helper.R"]);
+        assert_eq!(generated, ["runRFclust_1.R"]);
+    }
     #[test]
     fn groups_unlinked_images_but_not_protected_trees() {
         let files = ["images/run1/a.tif", "images/run2/b.tif", "raw/set1/a.txt",

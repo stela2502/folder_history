@@ -3,7 +3,8 @@ use crate::*;
 use folder_history::core::history_db::{DbArchiveView, DbIssues, MatchDecision, WizardInternals};
 use std::collections::HashSet;
 use folder_history::core::ArtifactRole;
-use super::app::{App, open_indexed_file, open_indexed_entry};
+use super::file::{self, FileAction};
+use super::app::{App, open_indexed_file};
 
 
 impl App {
@@ -22,7 +23,11 @@ impl App {
             if ui.button("← Back to overview").clicked() { self.wizard_mode = false; }
             ui.separator(); ui.heading("File & folder classification");
         });
-        ui.label(&source).on_hover_text(root.join(&source).display().to_string());
+        if let Some(action) = file::show(ui, &source, &source, false, None) {
+            if let Err(e) = file::perform(ui, &root, &source, action) {
+                self.status = format!("Cannot access {source}: {e}");
+            }
+        }
         if self.wizard_source != source || self.wizard_data.is_none() {
             self.wizard_source = source.clone();
             self.wizard_data = None;
@@ -38,9 +43,9 @@ impl App {
             }
         }
         if let Some(data) = self.wizard_data.as_mut() {
-            if let Some(path) = show_wizard_data(ui, data, &self.classification_errors) {
-                if let Err(e) = open_indexed_entry(&root, &path) {
-                    self.status = format!("Cannot open entry: {e}");
+            if let Some((path, action)) = show_wizard_data(ui, data, &self.classification_errors) {
+                if let Err(e) = file::perform(ui, &root, &path, action) {
+                    self.status = format!("Cannot access entry: {e}");
                 }
             }
         }
@@ -89,7 +94,7 @@ fn show_wizard_data(
     ui: &mut egui::Ui,
     data: &mut WizardInternals,
     errors: &std::collections::HashMap<String, String>,
-) -> Option<String> {
+) -> Option<(String, FileAction)> {
     // One visible row per physical artifact. Keep every occurrence in WizardInternals
     // so saving still updates every file_matches record, including hidden repeats.
     let mut seen = HashSet::new();
@@ -143,7 +148,7 @@ fn show_wizard_data(
     // Collect edits first, then propagate them to *all* occurrences of each file.
     // Never delete or merge persisted provenance evidence.
     let mut changes: Vec<(i64, String)> = Vec::new();
-    let mut open_entry: Option<String> = None;
+    let mut file_action = None;
     egui::ScrollArea::vertical().max_height((ui.available_height()-180.0).max(120.0)).show(ui, |ui| {
         for (title, reads) in [("Files read by the script:", true), ("Files created by the script:", false)] {
             ui.heading(title);
@@ -158,10 +163,10 @@ fn show_wizard_data(
                     }
                     let short = item.artifact.rsplitn(3, '/').take(2).collect::<Vec<_>>();
                     let short = short.into_iter().rev().collect::<Vec<_>>().join("/");
-                    if ui.selectable_label(false, short)
-                        .on_hover_text(format!("{}\nDouble-click to open", item.artifact))
-                        .double_clicked() {
-                        open_entry = Some(item.artifact.clone());
+                    if let Some(action) = file::show(ui, &short, &item.artifact, false, None) {
+                        if action != FileAction::Select {
+                            file_action = Some((item.artifact.clone(), action));
+                        }
                     }
                     if occurrences > 1 {
                         ui.small(format!("{occurrences} occurrences"))
@@ -199,7 +204,7 @@ fn show_wizard_data(
         d.insert_temp(state_id, selected);
         d.insert_temp(role_id, bulk_role);
     });
-    open_entry
+    file_action
 }
 
 fn current_classification(item: &folder_history::core::history_db::WizardMatch) -> &str {

@@ -23,13 +23,13 @@ fn matches_pattern(pattern: &str, path: &str) -> bool {
     i == p.len()
 }
 
-/// Recompute only inferred classifications. Confirmed rows are never updated.
+/// Apply concrete inferences while preserving confirmed concrete roles.
 pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> Result<()> {
     let (patterns, groups, operations) = provenance::classification_rules(root)?;
     let mut inferred = HashMap::<String, (ArtifactRole, String)>::new();
     for path in paths {
         for (pattern, role) in &patterns {
-            if matches_pattern(pattern, path) {
+            if *role != ArtifactRole::Unknown && matches_pattern(pattern, path) {
                 inferred.insert(path.clone(), (*role, format!("file_types:{pattern}")));
             }
         }
@@ -38,10 +38,12 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
     for path in paths {
         for (required, group_role, member_role) in &groups {
             if required.is_empty() || !required.iter().all(|name| paths.contains(&format!("{path}/{name}"))) { continue; }
-            inferred.insert(path.clone(), (*group_role, "file_groups".into()));
-            if let Some(role) = member_role {
+            if *group_role != ArtifactRole::Unknown {
+                inferred.insert(path.clone(), (*group_role, "file_groups".into()));
+            }
+            if let Some(role) = member_role.filter(|role| *role != ArtifactRole::Unknown) {
                 for name in required {
-                    inferred.insert(format!("{path}/{name}"), (*role, "file_groups:member".into()));
+                    inferred.insert(format!("{path}/{name}"), (role, "file_groups:member".into()));
                 }
             }
         }
@@ -53,6 +55,7 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (path, direction, evidence) in matches {
         for (name, arg, which, role, descendants) in &operations {
+            if *role == ArtifactRole::Unknown { continue; }
             let marker = format!("via {name} [");
             let exact = format!("via {name} [{arg}]");
             if !evidence.contains(&exact) && !(arg.is_empty() && evidence.contains(&marker)) { continue; }
@@ -66,11 +69,10 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
             }
         }
     }
-    // A changed YAML must also clear outdated automatic values, never manual ones.
-    db.execute("DELETE FROM artifact_roles WHERE confirmed=0", [])?;
+    // Missing or unknown evidence must not erase an existing concrete role.
     for (path, (role, source)) in inferred {
-        db.execute("INSERT INTO artifact_roles(path,role,source,confirmed) VALUES (?1,?2,?3,0) ON CONFLICT(path) DO UPDATE SET role=excluded.role,source=excluded.source,confirmed=0 WHERE artifact_roles.confirmed=0",
-            params![path,role.label(),source])?;
+        db.execute("INSERT INTO artifact_roles(path,role,source,confirmed) VALUES (?1,?2,?3,0) ON CONFLICT(path) DO UPDATE SET role=excluded.role,source=excluded.source,confirmed=0 WHERE artifact_roles.confirmed=0 OR artifact_roles.role=?4",
+            params![path,role.label(),source,ArtifactRole::Unknown.label()])?;
     }
     Ok(())
 }
@@ -86,19 +88,23 @@ pub(crate) fn refresh(db: &Connection, root: &Path, paths: &HashSet<String>) -> 
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(dir.join(".folder_history")).unwrap();
         let config = dir.join(".folder_history/file_types.yaml");
-        std::fs::write(&config, "file_types:\n  - {pattern: '*.h5ad', file_type: RawData}\n").unwrap();
+        std::fs::write(&config, "file_types:\n  - {pattern: '*.testrole', file_type: RawData}\n").unwrap();
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE artifact_roles(path TEXT PRIMARY KEY,role TEXT NOT NULL,source TEXT NOT NULL,confirmed INTEGER NOT NULL);
             CREATE TABLE artifacts(id INTEGER PRIMARY KEY,path TEXT,kind TEXT);
             CREATE TABLE file_matches(artifact_id INTEGER,direction TEXT,evidence TEXT);").unwrap();
-        let paths = HashSet::from(["a.h5ad".to_owned(), "b.h5ad".to_owned()]);
+        let paths = HashSet::from(["a.testrole".to_owned(), "b.testrole".to_owned()]);
         refresh(&db, &dir, &paths).unwrap();
-        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Raw experimental data");
-        db.execute("UPDATE artifact_roles SET role='Reference data',confirmed=1 WHERE path='a.h5ad'", []).unwrap();
-        std::fs::write(&config, "file_types:\n  - {pattern: '*.h5ad', file_type: StatisticalResults}\n").unwrap();
+        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.testrole'", [], |r| r.get::<_,String>(0)).unwrap(), "Raw experimental data");
+        db.execute("UPDATE artifact_roles SET role='Reference data',confirmed=1 WHERE path='a.testrole'", []).unwrap();
+        db.execute("UPDATE artifact_roles SET role='Unknown',confirmed=1 WHERE path='b.testrole'", []).unwrap();
+        std::fs::write(&config, "file_types:\n  - {pattern: '*.testrole', file_type: StatisticalResults}\n").unwrap();
         refresh(&db, &dir, &paths).unwrap();
-        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Reference data");
-        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='b.h5ad'", [], |r| r.get::<_,String>(0)).unwrap(), "Statistical results");
+        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='a.testrole'", [], |r| r.get::<_,String>(0)).unwrap(), "Reference data");
+        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='b.testrole'", [], |r| r.get::<_,String>(0)).unwrap(), "Statistical results");
+        std::fs::write(&config, "file_types:\n  - {pattern: '*.testrole', file_type: Unknown}\n").unwrap();
+        refresh(&db, &dir, &paths).unwrap();
+        assert_eq!(db.query_row("SELECT role FROM artifact_roles WHERE path='b.testrole'", [], |r| r.get::<_,String>(0)).unwrap(), "Statistical results");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

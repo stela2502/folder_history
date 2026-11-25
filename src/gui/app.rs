@@ -386,6 +386,10 @@ impl App {
         self.relations = std::mem::take(&mut view.relations);
         self.issues = std::mem::take(&mut view.issues);
         self.group_names = std::mem::take(&mut view.group_names);
+        self.search_steps = std::mem::take(&mut view.search_steps);
+        self.ignored_review_scripts = std::mem::take(&mut view.ignored_review_scripts);
+        self.wizard_data = None;
+        self.classification_errors.clear();
         self.analysis_groups = std::mem::take(&mut view.analysis_groups);
         self.analysis_assignment = std::mem::take(&mut view.analysis_assignment);
         self.scan_summary = summary.clone();
@@ -402,7 +406,7 @@ impl App {
         self.scan_events = Some(rx);
         self.scan_cancel = Some(cancel);
         self.scan_summary = "Re-scan started: inventory and provenance extraction running...".into();
-        self.status = "Re-scan running; existing results remain available until completion.".into();
+        self.status = "Re-scan running…".into();
         std::thread::spawn(move || {
             let result = (|| -> Result<()> {
                 let scan_result = {
@@ -589,7 +593,29 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_open();
         self.poll_scan();
-        if self.scan_events.is_some() || self.open_events.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(150)); }
+        if self.scan_events.is_some() || self.open_events.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        // The worker can hold a SQLite write lock. The archive views issue
+        // synchronous queries, so only render scan progress until it finishes.
+        if self.scan_events.is_some() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("FolderHistory");
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&self.status);
+                });
+                if let Some(cancel) = &self.scan_cancel {
+                    let cancelling = cancel.load(Ordering::Relaxed);
+                    if ui.add_enabled(!cancelling, egui::Button::new(
+                        if cancelling { "Cancelling…" } else { "Cancel scan" },
+                    )).clicked() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            return;
+        }
         // Record user navigation once per frame; Back/Forward do not create new entries.
         let before = NavState { tab: self.tab, selected: self.selected };
         let mut history_navigation = false;
@@ -614,6 +640,9 @@ impl eframe::App for App {
                 if ui.add_enabled(self.scan_events.is_none() && self.open_events.is_none(), egui::Button::new("Open existing history")).clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() { self.open(p, false); }
                 }
+                ui.menu_button(concat!("About v", env!("CARGO_PKG_VERSION")), |ui| {
+                    super::diagnostics::show(ui);
+                });
                 if self.db.is_some() {
                     ui.label("Index: local, editable");
                     let scan_label = if self.scan_events.is_some() { "Scanning…" } else { "Scan / Rescan archive" };
@@ -686,6 +715,10 @@ impl eframe::App for App {
                     ui.label(&message);
                     if ui.button("Close").clicked() { self.error_popup = None; }
                 });
+        }
+        if self.scan_events.is_some() {
+            ctx.request_repaint();
+            return;
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.db.is_none() {
@@ -1081,8 +1114,8 @@ impl eframe::App for App {
                     }
                     let mut review_action: Option<(String, bool)> = None;
                     let mut selected_script: Option<(String, Option<(String, String)>)> = None;
-                    let mut open_script: Option<String> = None;
-                    let mut open_entry: Option<String> = None;
+                    use super::file::{self, FileAction};
+                    let mut file_action = None;
                     let mut open_folder: Option<String> = None;
                     egui::ScrollArea::vertical().id_salt("repair_script_tree").max_height(420.0).show(ui, |ui| {
                         for (folder, scripts) in folders {
@@ -1099,12 +1132,14 @@ impl eframe::App for App {
                                     let name = script.rsplit('/').next().unwrap_or(&script);
                                     let count: usize = refs.iter().map(|r| r.2).sum();
                                     ui.horizontal(|ui| {
-                                        let response = ui.selectable_label(false, format!("{name} · {count} {}", if show_unresolved { "issues" } else { "links" }))
-                                            .on_hover_text(&script);
-                                        if response.double_clicked() { open_script = Some(script.clone()); }
-                                        else if response.clicked() { selected_script = Some((script.clone(), None)); }
+                                        let label = format!("{name} · {count} {}", if show_unresolved { "issues" } else { "links" });
+                                        match file::show(ui, &label, &script, false, None) {
+                                            Some(FileAction::Select) => selected_script = Some((script.clone(), None)),
+                                            Some(action) => file_action = Some((script.clone(), action)),
+                                            None => {}
+                                        }
                                         if ui.small_button("Review").clicked() { selected_script = Some((script.clone(), None)); }
-                                        if ui.small_button("Open").clicked() { open_script = Some(script.clone()); }
+                                        if ui.small_button("Open").clicked() { file_action = Some((script.clone(), FileAction::Open)); }
                                         if show_ignored {
                                             if ui.small_button("Restore").clicked() { review_action = Some((script.clone(), false)); }
                                         } else if ui.small_button("Ignore").on_hover_text("Move to Ignored; scanning and automatic provenance continue").clicked() {
@@ -1113,12 +1148,13 @@ impl eframe::App for App {
                                     });
                                     ui.indent(("repair_refs", &script), |ui| {
                                         for (category, filename, occurrences) in &refs {
-                                            let response = ui.selectable_label(false, format!("{filename} ({occurrences}) · {category}"))
-                                                .on_hover_text(format!("Source: {script}\nDouble-click to open file/folder"));
-                                            if response.double_clicked() {
-                                                open_entry = Some(filename.clone());
-                                            } else if response.clicked() {
-                                                selected_script = Some((script.clone(), Some((category.clone(), filename.clone()))));
+                                            let label = format!("{filename} ({occurrences}) · {category}");
+                                            match file::show(ui, &label, filename, false, None) {
+                                                Some(FileAction::Select) => {
+                                                    selected_script = Some((script.clone(), Some((category.clone(), filename.clone()))));
+                                                }
+                                                Some(action) => file_action = Some((filename.clone(), action)),
+                                                None => {}
                                             }
                                         }
                                     });
@@ -1144,14 +1180,9 @@ impl eframe::App for App {
                             if let Err(e) = open_indexed_entry(root, &folder) { self.status = format!("Cannot open folder: {e}"); }
                         }
                     }
-                    if let Some(path) = open_entry {
-                        if let Some(root) = &self.root {
-                            if let Err(e) = open_indexed_entry(root, &path) { self.status = format!("Cannot open entry: {e}"); }
-                        }
-                    }
-                    if let Some(script) = open_script {
-                        if let Some(root) = &self.root {
-                            if let Err(e) = open_indexed_file(root, &script) { self.status = format!("Cannot open script: {e}"); }
+                    if let (Some((path, action)), Some(root)) = (file_action, &self.root) {
+                        if let Err(e) = file::perform(ui, root, &path, action) {
+                            self.status = format!("Cannot access {path}: {e}");
                         }
                     }
                     if let Some((source, reference)) = selected_script {

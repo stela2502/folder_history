@@ -210,11 +210,21 @@ pub fn excluded_dir(name: &str, _hidden: bool) -> bool {
     // This applies at every depth, not only at the archive root.
     name.starts_with('.') || ["work", "__pycache__", "target", "venv", "node_modules", "lost+found", "rfclusttmp"].contains(&lower.as_str())
 }
+// RFclust.SGE writes runRFclust_<run>_<slice> worker scripts and R logs.
+fn is_rfclust_worker(name: &str) -> bool {
+    let Some((stem, extension)) = name.rsplit_once('.') else { return false; };
+    let Some((run, slice)) = stem.strip_prefix("runrfclust_")
+        .and_then(|suffix| suffix.rsplit_once('_')) else { return false; };
+    matches!(extension, "r" | "sh" | "rout")
+        && !run.is_empty() && !slice.is_empty() && slice.bytes().all(|b| b.is_ascii_digit())
+}
+
 pub fn excluded_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Generated/hidden files are not user-authored analysis scripts.
     name.starts_with('.') || lower.ends_with('~') || lower.ends_with(".swp") || lower.ends_with(".swo")
         || lower.ends_with("-checkpoint.py") || lower.ends_with("-checkpoint.sh")
+        || is_rfclust_worker(&lower)
 }
 // A candidate is only made when a script explicitly mentions both artifacts.
 // We never infer a dependency from timestamps alone or from mere folder proximity.
@@ -338,6 +348,24 @@ mod tests {
 
     use rusqlite::{params, OpenFlags};
     use super::super::history_db::{BatchWorkspace, archive_working_copy, publish_archive_snapshot};
+
+    #[test]
+    fn rfclust_worker_scripts_and_logs_are_excluded() {
+        for path in [
+            "runRFclust_BioData_4_RFclustering_on_aurora_RFclust_1_10.R",
+            "runRFclust_BioData_4_RFclustering_on_aurora_RFclust_1_10.sh",
+            "runRFclust_RFrun2_1.Rout",
+        ] {
+            assert!(excluded_file(path), "{path}");
+        }
+        for path in [
+            "BioData_4_RFclustering_on_aurora.R",
+            "runRFclust_RFrun2_1.RData",
+            "runRFclust_summary.R",
+        ] {
+            assert!(!excluded_file(path), "{path}");
+        }
+    }
 
     #[test]
     fn scanner_records_matches_directly_and_preserves_decisions() {

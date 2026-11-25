@@ -839,11 +839,14 @@ fn pseudobulk_output_is_one_folder_in_wizard() -> Result<()> {
     schema(&db)?;
     let script = "analysis/run.py";
     let folder = "analysis/pseudobulk_leiden_stats";
+    let dotted_folder = "analysis/pseudobulk_leiden5_merged0.98_stats";
     let tables = [
         "analysis/pseudobulk_leiden_stats/leiden_cluster_6.csv",
         "analysis/pseudobulk_leiden_stats/nested/leiden_cluster_10.csv",
+        "analysis/pseudobulk_leiden5_merged0.98_stats/leiden_cluster_6.csv",
     ];
-    let paths: HashSet<String> = tables.into_iter().map(str::to_owned).collect();
+    let paths: HashSet<String> = tables.into_iter()
+        .chain([folder, dotted_folder]).map(str::to_owned).collect();
     let rules: RuleSet = serde_yaml::from_str(include_str!("../../../rules/scientific_functions.yaml"))?;
 
     analyze_source(
@@ -853,11 +856,22 @@ fn pseudobulk_output_is_one_folder_in_wizard() -> Result<()> {
         &mut HashMap::new(), &rules.plotting, &rules.operations, "python",
     )?;
 
+    analyze_source(
+        &db, script,
+        "functions.write_pseudobulk_stats_tables(adata, 'pseudobulk_leiden5_merged0.98_stats', 'leiden5_merged0.98')",
+        2, &paths, &mut Environment::default(), &rules.functions,
+        &mut HashMap::new(), &rules.plotting, &rules.operations, "python",
+    )?;
+    crate::core::classification::refresh(&db, std::path::Path::new("."), &paths)?;
+
     let wizard = db.issues(db.source_artifact_id(script)?)?;
     let outputs: Vec<_> = wizard.writes().flat_map(|group| &group.matches)
-        .map(|item| (item.artifact.as_str(), item.direction.as_str()))
+        .map(|item| (item.artifact.as_str(), item.direction.as_str(), item.role.as_deref()))
         .collect();
-    assert_eq!(outputs, vec![(folder, "writes_directory")]);
+    assert_eq!(outputs.len(), 2);
+    for path in [folder, dotted_folder] {
+        assert!(outputs.contains(&(path, "writes_directory", Some("Statistical results"))));
+    }
 
     let (_, relations, _) = db.archive_view()?;
     for table in tables {
